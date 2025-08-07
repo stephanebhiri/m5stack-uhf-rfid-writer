@@ -1,0 +1,855 @@
+// Core2 + UHF (JRD-4035) — WRITE EPC avec gestion longueurs variables
+// PORT-A remappé UART : Serial2.begin(..., RX=33, TX=32)
+// Version robuste avec buffer optimisé et gestion PC word
+
+#include <M5Unified.h>
+#include "UNIT_UHF_RFID.h"
+
+// === Configuration ===
+static constexpr int RX_PIN = 33;
+static constexpr int TX_PIN = 32;
+static constexpr uint16_t TX_PWR_DBM10 = 2600;     // 26.00 dBm
+static constexpr uint32_t ACCESS_PWD   = 0x00000000; // Adapter si besoin
+static constexpr size_t RX_BUFFER_SIZE = 1024;     // Buffer UART augmenté
+static constexpr uint32_t CMD_TIMEOUT  = 500;      // Timeout commandes ms
+
+Unit_UHF_RFID uhf;
+
+// === Codes d'erreur ===
+enum WriteError {
+  WRITE_OK = 0,
+  WRITE_NO_TAG = 0x09,
+  WRITE_ACCESS_DENIED = 0x16,
+  WRITE_MEMORY_OVERRUN = 0xA3,
+  WRITE_MEMORY_LOCKED = 0xA4,
+  WRITE_INSUFFICIENT_POWER = 0xB3,
+  WRITE_UNKNOWN_ERROR = 0xFF
+};
+
+// === Structure pour stocker les infos d'un tag ===
+struct TagInfo {
+  uint8_t tid[8];
+  uint8_t epc[62];  // Max 496 bits
+  size_t epc_len;
+  uint16_t pc_word;
+  bool has_tid;
+};
+
+TagInfo current_tag;
+
+// === Utils protocole EL-UHF-RMT01/JRD-4035 ===
+static uint8_t cs8(const uint8_t* p, size_t n) {
+  uint32_t s = 0;
+  for (size_t i = 0; i < n; i++) s += p[i];
+  return uint8_t(s & 0xFF);
+}
+
+// Vidage complet du buffer RX avec timeout dynamique
+static void clearRxBuffer(HardwareSerial& s, uint32_t timeout = 50) {
+  uint32_t start = millis();
+  while (millis() - start < timeout) {
+    while (s.available()) {
+      s.read();
+      start = millis();  // Reset timeout à chaque octet reçu
+    }
+    delay(1);
+  }
+}
+
+// Stop multi-inventaire amélioré
+static void stopMultiInv(HardwareSerial& s) {
+  const uint8_t stop[] = {0xBB, 0x00, 0x28, 0x00, 0x00, 0x28, 0x7E};
+  clearRxBuffer(s, 20);
+  s.write(stop, sizeof(stop));
+  s.flush();
+  delay(60);
+  clearRxBuffer(s, 30);
+}
+
+// === Envoi/recv bruts améliorés ===
+static bool sendCmdRaw(const uint8_t* frame, size_t len, uint8_t* resp, size_t& rlen, uint32_t tout_ms = CMD_TIMEOUT) {
+  clearRxBuffer(Serial2, 20);
+  Serial2.write(frame, len);
+  Serial2.flush();
+  
+  uint32_t t0 = millis();
+  size_t idx = 0;
+  bool frame_started = false;
+  
+  while (millis() - t0 < tout_ms && idx < rlen) {
+    if (Serial2.available()) {
+      uint8_t b = (uint8_t)Serial2.read();
+      
+      // Attendre le début de trame 0xBB
+      if (!frame_started) {
+        if (b == 0xBB) {
+          frame_started = true;
+          resp[idx++] = b;
+        }
+      } else {
+        resp[idx++] = b;
+        // Si on a reçu 0x7E, on a probablement la trame complète
+        if (b == 0x7E && idx >= 7) {
+          // Vérifier que c'est une trame valide
+          if (idx >= 5) {
+            uint16_t pl = (resp[3] << 8) | resp[4];
+            size_t expected_len = 5 + pl + 2;
+            if (idx >= expected_len) {
+              break;  // Trame complète reçue
+            }
+          }
+        }
+      }
+    }
+  }
+  
+  rlen = idx;
+  return (idx >= 7 && resp[0] == 0xBB && resp[idx-1] == 0x7E);
+}
+
+// === Analyse des erreurs ===
+static WriteError parseWriteError(uint8_t error_code) {
+  switch(error_code) {
+    case 0x09: return WRITE_NO_TAG;
+    case 0x16: return WRITE_ACCESS_DENIED;
+    case 0xA3: return WRITE_MEMORY_OVERRUN;
+    case 0xA4: return WRITE_MEMORY_LOCKED;
+    case 0xB3: return WRITE_INSUFFICIENT_POWER;
+    default: return WRITE_UNKNOWN_ERROR;
+  }
+}
+
+static const char* errorToString(WriteError err) {
+  switch(err) {
+    case WRITE_OK: return "OK";
+    case WRITE_NO_TAG: return "No tag";
+    case WRITE_ACCESS_DENIED: return "Access denied";
+    case WRITE_MEMORY_OVERRUN: return "Memory overrun";
+    case WRITE_MEMORY_LOCKED: return "Memory locked";
+    case WRITE_INSUFFICIENT_POWER: return "Low power";
+    default: return "Unknown error";
+  }
+}
+
+// === Lecture du TID ===
+static bool readTid(uint8_t tid[8]) {
+  // READ bank 2 (TID), word 0, 4 words
+  uint8_t frame[32];
+  size_t i = 0;
+  
+  frame[i++] = 0xBB;
+  frame[i++] = 0x00;  // Type
+  frame[i++] = 0x39;  // CMD = Read
+  frame[i++] = 0x00;  // PL high
+  frame[i++] = 0x09;  // PL low = 9
+  
+  // AccessPwd
+  frame[i++] = 0x00;
+  frame[i++] = 0x00;
+  frame[i++] = 0x00;
+  frame[i++] = 0x00;
+  
+  frame[i++] = 0x02;  // Bank = TID
+  frame[i++] = 0x00;  // WordPtr high
+  frame[i++] = 0x00;  // WordPtr low
+  frame[i++] = 0x00;  // DL high
+  frame[i++] = 0x04;  // DL low = 4 words = 8 bytes
+  
+  uint8_t cs = cs8(&frame[1], i - 1);
+  frame[i++] = cs;
+  frame[i++] = 0x7E;
+  
+  uint8_t resp[256];
+  size_t rlen = sizeof(resp);
+  
+  if (!sendCmdRaw(frame, i, resp, rlen)) {
+    return false;
+  }
+  
+  // Parser la réponse
+  if (resp[2] == 0x39) {
+    // Format avec UL
+    if (rlen >= 7) {
+      uint8_t ul = resp[5];  // UL = taille PC+EPC
+      size_t data_offset = 6 + ul;
+      
+      // Vérifier format alternatif (DATA only)
+      uint16_t pl = (resp[3] << 8) | resp[4];
+      if (pl == 8) {  // 4 words * 2 = 8 bytes
+        // Format DATA only
+        memcpy(tid, &resp[5], 8);
+        return true;
+      } else if (data_offset + 8 <= rlen - 2) {
+        // Format avec UL
+        memcpy(tid, &resp[data_offset], 8);
+        return true;
+      }
+    }
+  }
+  
+  return false;
+}
+
+// === Select par EPC simple (utilise la lib) ===
+static bool selectByEpc(Unit_UHF_RFID& uhf_ref, const uint8_t* epc, size_t epc_len) {
+  // La lib attend un non-const, faire une copie temporaire
+  uint8_t epc_copy[62];
+  memcpy(epc_copy, epc, min(epc_len, sizeof(epc_copy)));
+  return uhf_ref.select(epc_copy);
+}
+
+// === Select par TID (format corrigé) ===
+static bool selectByTid(const uint8_t tid[8]) {
+  uint8_t frame[32];
+  size_t i = 0;
+  
+  frame[i++] = 0xBB;
+  frame[i++] = 0x00;
+  frame[i++] = 0x0C;  // CMD = Select
+  frame[i++] = 0x00;
+  frame[i++] = 0x13;  // PL = 19
+  
+  frame[i++] = 0x01;  // Target = 0x01 pour Session S0
+  frame[i++] = 0x00;  // Action = 0x00
+  frame[i++] = 0x02;  // MemBank = 0x02 (TID)
+  
+  // Pointer en bits (0 = début du TID)
+  frame[i++] = 0x00;
+  frame[i++] = 0x00;
+  frame[i++] = 0x00;
+  frame[i++] = 0x00;
+  
+  frame[i++] = 0x40;  // Length = 0x40 = 64 bits
+  frame[i++] = 0x00;  // Truncate = 0x00 (No)
+  
+  // TID data (8 bytes)
+  memcpy(&frame[i], tid, 8);
+  i += 8;
+  
+  uint8_t cs = cs8(&frame[1], i - 1);
+  frame[i++] = cs;
+  frame[i++] = 0x7E;
+  
+  uint8_t resp[128];
+  size_t rlen = sizeof(resp);
+  
+  bool result = sendCmdRaw(frame, i, resp, rlen);
+  
+  // Debug
+  if (result) {
+    Serial.print("Select TID resp: ");
+    for (size_t k = 0; k < min(rlen, (size_t)20); k++) {
+      Serial.printf("%02X ", resp[k]);
+    }
+    Serial.println();
+  }
+  
+  return result && resp[2] == 0x0C;
+}
+
+// === Select par EPC format raw (alternative) ===
+static bool selectByEpcRaw(const uint8_t* epc, size_t epc_len) {
+  uint8_t frame[64];
+  size_t i = 0;
+  
+  frame[i++] = 0xBB;
+  frame[i++] = 0x00;
+  frame[i++] = 0x0C;  // CMD = Select
+  
+  uint16_t pl = 11 + epc_len;  // 11 bytes params + EPC data
+  frame[i++] = (pl >> 8);
+  frame[i++] = (pl & 0xFF);
+  
+  frame[i++] = 0x01;  // Target = Session S0
+  frame[i++] = 0x00;  // Action = 0x00
+  frame[i++] = 0x01;  // MemBank = 0x01 (EPC)
+  
+  // Pointer = 0x20 bits (32 bits = 4 bytes offset = début de l'EPC après CRC+PC)
+  frame[i++] = 0x00;
+  frame[i++] = 0x00;
+  frame[i++] = 0x00;
+  frame[i++] = 0x20;  // 32 bits offset
+  
+  frame[i++] = (epc_len * 8);  // Length en bits
+  frame[i++] = 0x00;  // Truncate = No
+  
+  // EPC data
+  memcpy(&frame[i], epc, epc_len);
+  i += epc_len;
+  
+  uint8_t cs = cs8(&frame[1], i - 1);
+  frame[i++] = cs;
+  frame[i++] = 0x7E;
+  
+  uint8_t resp[128];
+  size_t rlen = sizeof(resp);
+  
+  bool result = sendCmdRaw(frame, i, resp, rlen, 200);
+  
+  // Debug
+  if (result) {
+    Serial.print("Select EPC resp: ");
+    for (size_t k = 0; k < min(rlen, (size_t)20); k++) {
+      Serial.printf("%02X ", resp[k]);
+    }
+    Serial.println();
+  }
+  
+  return result && resp[2] == 0x0C;
+}
+
+// === Probe de capacité EPC ===
+static size_t probeEpcCapacity(uint32_t accessPwd = 0) {
+  stopMultiInv(Serial2);
+  
+  // Essayer de lire différentes longueurs
+  const size_t word_counts[] = {6, 8, 12, 16, 24, 31};  // 96, 128, 192, 256, 384, 496 bits
+  size_t last_valid = 6;
+  
+  for (size_t wc : word_counts) {
+    uint8_t frame[32];
+    size_t i = 0;
+    
+    frame[i++] = 0xBB;
+    frame[i++] = 0x00;
+    frame[i++] = 0x39;  // READ
+    frame[i++] = 0x00;
+    frame[i++] = 0x09;  // PL = 9
+    
+    // AccessPwd
+    frame[i++] = (accessPwd >> 24);
+    frame[i++] = (accessPwd >> 16);
+    frame[i++] = (accessPwd >> 8);
+    frame[i++] = accessPwd;
+    
+    frame[i++] = 0x01;  // Bank = EPC
+    frame[i++] = 0x00;
+    frame[i++] = 0x02;  // WordPtr = 2 (début EPC)
+    frame[i++] = (wc >> 8);
+    frame[i++] = (wc & 0xFF);
+    
+    uint8_t cs = cs8(&frame[1], i - 1);
+    frame[i++] = cs;
+    frame[i++] = 0x7E;
+    
+    uint8_t resp[512];
+    size_t rlen = sizeof(resp);
+    
+    if (sendCmdRaw(frame, i, resp, rlen, 300)) {
+      if (resp[2] == 0x39) {
+        last_valid = wc;
+        Serial.printf("Probe: %d words OK\n", wc);
+      } else if (resp[2] == 0xFF) {
+        uint8_t err = (rlen > 5) ? resp[5] : 0xFF;
+        if (err == 0x09 || err == 0xA3) {
+          Serial.printf("Probe: %d words -> limit reached (0x%02X)\n", wc, err);
+          break;
+        }
+      }
+    }
+  }
+  
+  return last_valid * 2;  // Retourner en octets
+}
+
+// === Écriture PC word ===
+static bool writePcWord(uint16_t pc_word, uint32_t accessPwd) {
+  uint8_t frame[32];
+  size_t i = 0;
+  
+  frame[i++] = 0xBB;
+  frame[i++] = 0x00;
+  frame[i++] = 0x49;  // WRITE
+  frame[i++] = 0x00;
+  frame[i++] = 0x0B;  // PL = 11 (9 + 2 bytes data)
+  
+  // AccessPwd
+  frame[i++] = (accessPwd >> 24);
+  frame[i++] = (accessPwd >> 16);
+  frame[i++] = (accessPwd >> 8);
+  frame[i++] = accessPwd;
+  
+  frame[i++] = 0x01;  // Bank = EPC
+  frame[i++] = 0x00;
+  frame[i++] = 0x01;  // WordPtr = 1 (PC word)
+  frame[i++] = 0x00;
+  frame[i++] = 0x01;  // WordCount = 1
+  
+  frame[i++] = (pc_word >> 8);
+  frame[i++] = (pc_word & 0xFF);
+  
+  uint8_t cs = cs8(&frame[1], i - 1);
+  frame[i++] = cs;
+  frame[i++] = 0x7E;
+  
+  uint8_t resp[128];
+  size_t rlen = sizeof(resp);
+  
+  if (!sendCmdRaw(frame, i, resp, rlen)) {
+    return false;
+  }
+  
+  return (resp[2] == 0x49);
+}
+
+// === WRITE EPC avec gestion PC ===
+static WriteError writeEpcWithPc(const uint8_t* epc, size_t epc_bytes, uint32_t accessPwd) {
+  // Calculer le PC word
+  uint16_t epc_words = epc_bytes / 2;
+  uint16_t pc_word = (epc_words << 11) | 0x3000;  // Length bits [15:11] + defaults
+  
+  Serial.printf("Writing EPC: %d bytes, PC=0x%04X\n", epc_bytes, pc_word);
+  
+  // 1. Écrire le PC word
+  if (!writePcWord(pc_word, accessPwd)) {
+    Serial.println("Failed to write PC word");
+    return WRITE_UNKNOWN_ERROR;
+  }
+  
+  delay(50);
+  
+  // 2. Écrire l'EPC
+  uint16_t pl = 9 + epc_bytes;
+  uint8_t buf[128];
+  size_t i = 0;
+  
+  buf[i++] = 0xBB;
+  buf[i++] = 0x00;
+  buf[i++] = 0x49;  // WRITE
+  buf[i++] = (pl >> 8);
+  buf[i++] = (pl & 0xFF);
+  
+  // AccessPwd
+  buf[i++] = (accessPwd >> 24);
+  buf[i++] = (accessPwd >> 16);
+  buf[i++] = (accessPwd >> 8);
+  buf[i++] = accessPwd;
+  
+  buf[i++] = 0x01;  // Bank = EPC
+  buf[i++] = 0x00;
+  buf[i++] = 0x02;  // WordPtr = 2 (début EPC)
+  buf[i++] = (epc_words >> 8);
+  buf[i++] = (epc_words & 0xFF);
+  
+  memcpy(&buf[i], epc, epc_bytes);
+  i += epc_bytes;
+  
+  uint8_t cs = cs8(&buf[1], 4 + pl);
+  buf[i++] = cs;
+  buf[i++] = 0x7E;
+  
+  uint8_t resp[256];
+  size_t rlen = sizeof(resp);
+  
+  if (!sendCmdRaw(buf, i, resp, rlen)) {
+    return WRITE_UNKNOWN_ERROR;
+  }
+  
+  // Analyser la réponse
+  if (resp[2] == 0x49) {
+    // Chercher le paramètre de statut (avant CS)
+    if (rlen >= 3 && resp[rlen-3] == 0x00) {
+      return WRITE_OK;
+    }
+    return WRITE_UNKNOWN_ERROR;
+  } else if (resp[2] == 0xFF && rlen > 5) {
+    return parseWriteError(resp[5]);
+  }
+  
+  return WRITE_UNKNOWN_ERROR;
+}
+
+// === Hex utilities ===
+static bool hexToBytes(const String& hex, uint8_t* out, size_t max_bytes) {
+  size_t len = hex.length();
+  if (len % 2 != 0 || len / 2 > max_bytes) return false;
+  
+  auto nyb = [](char c) -> int {
+    if (c >= '0' && c <= '9') return c - '0';
+    c |= 0x20;  // to lowercase
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    return -1;
+  };
+  
+  size_t bytes = len / 2;
+  for (size_t i = 0; i < bytes; i++) {
+    int a = nyb(hex[2*i]);
+    int b = nyb(hex[2*i+1]);
+    if (a < 0 || b < 0) return false;
+    out[i] = (a << 4) | b;
+  }
+  
+  return true;
+}
+
+static String bytesToHex(const uint8_t* data, size_t len) {
+  String result = "";
+  for (size_t i = 0; i < len; i++) {
+    char buf[3];
+    sprintf(buf, "%02X", data[i]);
+    result += buf;
+  }
+  return result;
+}
+
+// === Set Select Mode (commande 0x12) ===
+static bool setSelectMode(uint8_t mode) {
+  uint8_t frame[10];
+  size_t i = 0;
+  
+  frame[i++] = 0xBB;
+  frame[i++] = 0x00;
+  frame[i++] = 0x12;  // CMD = Set Select Mode
+  frame[i++] = 0x00;
+  frame[i++] = 0x01;  // PL = 1
+  frame[i++] = mode;  // 0x00=EPC, 0x01=TID, 0x02=User
+  
+  uint8_t cs = cs8(&frame[1], i - 1);
+  frame[i++] = cs;
+  frame[i++] = 0x7E;
+  
+  uint8_t resp[32];
+  size_t rlen = sizeof(resp);
+  
+  return sendCmdRaw(frame, i, resp, rlen, 200) && resp[2] == 0x12;
+}
+
+// === Interface utilisateur ===
+void displayStatus(const String& line1, const String& line2 = "", const String& line3 = "", const String& line4 = "", const String& line5 = "") {
+  M5.Display.fillScreen(BLACK);
+  M5.Display.setCursor(0, 0);
+  M5.Display.setTextSize(2);
+  
+  M5.Display.println(line1);
+  if (line2.length() > 0) M5.Display.println(line2);
+  if (line3.length() > 0) M5.Display.println(line3);
+  if (line4.length() > 0) M5.Display.println(line4);
+  if (line5.length() > 0) M5.Display.println(line5);
+  
+}
+
+// === Setup ===
+void setup() {
+  auto cfg = M5.config();
+  cfg.output_power = true;
+  M5.begin(cfg);
+  Serial.begin(115200);
+  
+  displayStatus("UHF Init...", "RX=33 TX=32");
+  
+  // Configuration UART optimisée
+  Serial2.setRxBufferSize(RX_BUFFER_SIZE);  // AVANT begin()
+  Serial2.begin(115200, SERIAL_8N1, RX_PIN, TX_PIN);
+  Serial2.setTimeout(300);
+  
+  uhf.begin(&Serial2, 115200, RX_PIN, TX_PIN, false);  // debug=false
+  
+  stopMultiInv(Serial2);
+  
+  // Vérifier la connexion
+  String info = "ERROR";
+  uint32_t t0 = millis();
+  while (info == "ERROR" && millis() - t0 < 3000) {
+    info = uhf.getVersion();
+    delay(120);
+  }
+  
+  Serial.println("Version: " + info);
+  
+  if (info == "ERROR") {
+    displayStatus("UHF ERROR", "Not detected!");
+    return;
+  }
+  
+  uhf.setTxPower(TX_PWR_DBM10);
+  
+  // Mode "need select" (optionnel - commenter si problème)
+  // setSelectMode(0x01);  // 0x00=pas de select requis, 0x01=select requis
+  
+  displayStatus("UHF Ready", "A: Scan", "B: Write 96b", "C: Write Auto");
+}
+
+// === Main loop ===
+void loop() {
+  M5.update();
+  
+  // Bouton A : Scan et analyse
+  if (M5.BtnA.wasPressed()) {
+    stopMultiInv(Serial2);
+    uint8_t n = uhf.pollingOnce();
+    
+    if (n == 0) {
+      displayStatus("Scan: 0", "No tags");
+      return;
+    }
+    
+    // Lire le premier tag
+    String epc_str = uhf.cards[0].epc_str;
+    current_tag.epc_len = epc_str.length() / 2;
+    hexToBytes(epc_str, current_tag.epc, sizeof(current_tag.epc));
+    
+    // Sélectionner et lire TID
+    if (uhf.select(uhf.cards[0].epc)) {
+      current_tag.has_tid = readTid(current_tag.tid);
+      
+      // Probe capacity
+      size_t capacity = probeEpcCapacity(ACCESS_PWD);
+      
+      String tid_str = current_tag.has_tid ? bytesToHex(current_tag.tid, 8) : "N/A";
+      
+      displayStatus(
+      "Tag found",
+      "EPC lenght: " + String(current_tag.epc_len * 8) + "b",
+      "EPC data: " + String(epc_str),
+      "Cap: " + String(capacity * 8) + "b",
+      "TID: " + tid_str.substring(0, 16)
+      );
+    } else {
+      displayStatus("Scan OK", "Select failed");
+    }
+  }
+  
+  // Bouton B : Write 96 bits fixe
+  if (M5.BtnB.wasPressed()) {
+    if (current_tag.epc_len == 0) {
+      displayStatus("Error", "Scan first!");
+      return;
+    }
+    
+    Serial.println("\n=== WRITE 96 BITS ===");
+    Serial.print("Current EPC: ");
+    for (size_t i = 0; i < current_tag.epc_len; i++) {
+      Serial.printf("%02X ", current_tag.epc[i]);
+    }
+    Serial.println();
+    
+    stopMultiInv(Serial2);
+    delay(50);  // Petit délai après stop
+    
+    // Essayer plusieurs méthodes de select
+    bool selected = false;
+    
+    // Méthode 1: Select EPC avec la lib (le plus fiable)
+    selected = uhf.select(current_tag.epc);
+    Serial.println("Select by lib: " + String(selected));
+    
+    if (!selected) {
+      // Méthode 2: Select EPC raw
+      selected = selectByEpcRaw(current_tag.epc, current_tag.epc_len);
+      Serial.println("Select by EPC raw: " + String(selected));
+    }
+    
+    if (!selected && current_tag.has_tid) {
+      // Méthode 3: Select par TID
+      selected = selectByTid(current_tag.tid);
+      Serial.println("Select by TID: " + String(selected));
+    }
+    
+    if (!selected) {
+      // Dernière tentative : stop + polling + select immédiat
+      stopMultiInv(Serial2);
+      delay(100);
+      uint8_t n = uhf.pollingOnce();
+      if (n > 0) {
+        Serial.println("Re-scan found EPC: " + uhf.cards[0].epc_str);
+        selected = uhf.select(uhf.cards[0].epc);
+        Serial.println("Select after poll: " + String(selected));
+      }
+    }
+    
+    if (!selected) {
+      displayStatus("Write fail", "Select error", "Check tag");
+      Serial.println("All select methods failed!");
+      return;
+    }
+    
+    // Nouveau EPC 96 bits
+    String newEpcHex = "302DB319A000000400009999";  // Exemple
+    uint8_t new_epc[12];
+    if (!hexToBytes(newEpcHex, new_epc, 12)) {
+      displayStatus("Error", "Invalid hex");
+      return;
+    }
+    
+    Serial.println("Target new EPC: " + newEpcHex);
+    Serial.print("New EPC bytes: ");
+    for (size_t i = 0; i < 12; i++) {
+      Serial.printf("%02X ", new_epc[i]);
+    }
+    Serial.println();
+    
+    WriteError err = writeEpcWithPc(new_epc, 12, ACCESS_PWD);
+    Serial.println("Write result: " + String(errorToString(err)));
+    
+    if (err == WRITE_OK) {
+      delay(100);
+      
+      // Vérifier
+      stopMultiInv(Serial2);
+      uint8_t n = uhf.pollingOnce();
+      bool found = false;
+      
+      Serial.println("\nVerification scan:");
+      for (uint8_t i = 0; i < n; i++) {
+        String s = uhf.cards[i].epc_str;
+        Serial.println("  Found: " + s);
+        s.toUpperCase();
+        if (s == newEpcHex) {
+          found = true;
+          Serial.println("  -> MATCH! Write successful!");
+        }
+      }
+      
+      if (!found) {
+        Serial.println("  -> New EPC not found in verification");
+      }
+      
+      Serial.println("====================\n");
+      
+      // Affichage LCD
+      M5.Display.fillScreen(BLACK);
+      M5.Display.setCursor(0, 0);
+      M5.Display.setTextSize(2);
+      M5.Display.println("Write 96b");
+      M5.Display.println(errorToString(err));
+      M5.Display.println(found ? "Verified!" : "Not found");
+      
+      M5.Display.setTextSize(1);
+      M5.Display.println();
+      M5.Display.println("New EPC:");
+      M5.Display.println(newEpcHex.substring(0, 24));
+    } else {
+      displayStatus("Write fail", errorToString(err));
+      Serial.println("Write failed with error: " + String(errorToString(err)));
+    }
+  }
+  
+  // Bouton C : Write auto-length
+  if (M5.BtnC.wasPressed()) {
+    if (current_tag.epc_len == 0) {
+      displayStatus("Error", "Scan first!");
+      return;
+    }
+    
+    Serial.println("\n=== WRITE AUTO-LENGTH ===");
+    Serial.print("Current EPC: ");
+    for (size_t i = 0; i < current_tag.epc_len; i++) {
+      Serial.printf("%02X ", current_tag.epc[i]);
+    }
+    Serial.printf("\nCurrent length: %d bits\n", current_tag.epc_len * 8);
+    
+    stopMultiInv(Serial2);
+    delay(50);
+    
+    // Probe capacity first
+    size_t capacity = probeEpcCapacity(ACCESS_PWD);
+    Serial.printf("Tag capacity: %d bytes (%d bits)\n", capacity, capacity * 8);
+    
+    // Select avec plusieurs méthodes
+    bool selected = false;
+    
+    // Méthode 1: Select avec la lib
+    selected = uhf.select(current_tag.epc);
+    Serial.println("Select by lib: " + String(selected));
+    
+    if (!selected) {
+      // Méthode 2: Select EPC raw
+      selected = selectByEpcRaw(current_tag.epc, current_tag.epc_len);
+      Serial.println("Select by EPC raw: " + String(selected));
+    }
+    
+    if (!selected && current_tag.has_tid) {
+      // Méthode 3: Select par TID
+      selected = selectByTid(current_tag.tid);
+      Serial.println("Select by TID: " + String(selected));
+    }
+    
+    if (!selected) {
+      // Dernière tentative
+      stopMultiInv(Serial2);
+      delay(100);
+      uint8_t n = uhf.pollingOnce();
+      if (n > 0) {
+        Serial.println("Re-scan found EPC: " + uhf.cards[0].epc_str);
+        selected = uhf.select(uhf.cards[0].epc);
+        Serial.println("Select after poll: " + String(selected));
+      }
+    }
+    
+    if (!selected) {
+      displayStatus("Write fail", "Select error", "Check tag");
+      Serial.println("All select methods failed!");
+      return;
+    }
+    
+    // Générer un EPC de la bonne taille
+    uint8_t new_epc[62];
+    size_t new_len = min(capacity, (size_t)24);  // Max 192 bits pour cet exemple
+    
+    // Pattern exemple
+    for (size_t i = 0; i < new_len; i++) {
+      new_epc[i] = 0xAA + i;
+    }
+    
+    Serial.printf("Writing new EPC: %d bytes (%d bits)\n", new_len, new_len * 8);
+    Serial.print("New EPC bytes: ");
+    for (size_t i = 0; i < new_len; i++) {
+      Serial.printf("%02X ", new_epc[i]);
+    }
+    Serial.println();
+    
+    WriteError err = writeEpcWithPc(new_epc, new_len, ACCESS_PWD);
+    Serial.println("Write result: " + String(errorToString(err)));
+    
+    String hex_str = bytesToHex(new_epc, min(new_len, (size_t)12));
+    
+    if (err == WRITE_OK) {
+      // Vérifier
+      delay(100);
+      stopMultiInv(Serial2);
+      uint8_t n = uhf.pollingOnce();
+      
+      Serial.println("\nVerification scan:");
+      bool found = false;
+      String target_hex = bytesToHex(new_epc, new_len);
+      target_hex.toUpperCase();
+      
+      for (uint8_t i = 0; i < n; i++) {
+        String s = uhf.cards[i].epc_str;
+        Serial.println("  Found: " + s);
+        s.toUpperCase();
+        if (s == target_hex) {
+          found = true;
+          Serial.println("  -> MATCH! Write successful!");
+        }
+      }
+      
+      if (!found) {
+        Serial.println("  -> New EPC not found in verification");
+      }
+      
+      // Mettre à jour current_tag
+      memcpy(current_tag.epc, new_epc, new_len);
+      current_tag.epc_len = new_len;
+      
+      Serial.println("====================\n");
+    }
+    
+    // Affichage LCD
+    M5.Display.fillScreen(BLACK);
+    M5.Display.setCursor(0, 0);
+    M5.Display.setTextSize(2);
+    M5.Display.printf("Write %db\n", new_len * 8);
+    M5.Display.println(errorToString(err));
+    
+    M5.Display.setTextSize(1);
+    M5.Display.println();
+    M5.Display.println("New EPC:");
+    // Afficher par lignes
+    for (size_t i = 0; i < new_len; i += 12) {
+      size_t len = min((size_t)12, new_len - i);
+      String line = bytesToHex(&new_epc[i], len);
+      M5.Display.println(line);
+    }
+  }
+}
