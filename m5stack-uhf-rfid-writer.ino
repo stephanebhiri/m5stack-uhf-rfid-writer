@@ -12,8 +12,18 @@ static constexpr uint16_t TX_PWR_DBM10 = 2600;     // 26.00 dBm
 static constexpr uint32_t ACCESS_PWD   = 0x00000000; // Adapter si besoin
 static constexpr size_t RX_BUFFER_SIZE = 1024;     // Buffer UART augmenté
 static constexpr uint32_t CMD_TIMEOUT  = 500;      // Timeout commandes ms
+static constexpr uint32_t LONG_PRESS_DURATION = 1000;  // 1 seconde pour appui long
+static constexpr uint16_t BEEP_FREQ = 2000;     // Fréquence bip 2kHz
+static constexpr uint8_t BEEP_DURATION = 100;   // Durée bip 100ms
 
 Unit_UHF_RFID uhf;
+
+// === Variables globales pour le mode continu ===
+bool continuous_scan_active = false;
+uint32_t button_press_start = 0;
+bool button_was_long_pressed = false;
+String last_detected_epc = "";
+uint32_t last_beep_time = 0;
 
 // === Codes d'erreur ===
 enum WriteError {
@@ -514,6 +524,64 @@ static bool setSelectMode(uint8_t mode) {
   return sendCmdRaw(frame, i, resp, rlen, 200) && resp[2] == 0x12;
 }
 
+// === Fonctions pour le mode scan continu ===
+
+// Bip court et discret
+static void shortBeep() {
+  uint32_t now = millis();
+  if (now - last_beep_time > 200) {  // Minimum 200ms entre les bips
+    M5.Speaker.tone(BEEP_FREQ, BEEP_DURATION, 0, false);  // Volume faible
+    last_beep_time = now;
+    Serial.println("♪ TAG DETECTED");
+  }
+}
+
+// Démarrage du mode inventory continu - Version simplifiée
+static bool startContinuousInventory() {
+  // Arrêter toute opération en cours
+  stopMultiInv(Serial2);
+  delay(100);
+  
+  Serial.println("Starting continuous mode (using repeated polling)");
+  
+  // Le mode continu sera géré par des appels répétés à pollingOnce()
+  // dans processContinuousScan() - plus simple et plus fiable
+  return true;
+}
+
+// Lecture des tags en mode continu - Version simplifiée
+static void processContinuousScan() {
+  if (!continuous_scan_active) return;
+  
+  // Utiliser pollingOnce de façon répétée (plus fiable)
+  uint8_t n = uhf.pollingOnce();
+  
+  if (n > 0) {
+    String epc_str = uhf.cards[0].epc_str;
+    
+    // Éviter les doublons trop rapides
+    if (epc_str != last_detected_epc || millis() - last_beep_time > 500) {
+      last_detected_epc = epc_str;
+      shortBeep();
+      
+      // Mettre à jour l'affichage avec le dernier tag
+      M5.Display.fillRect(0, 80, 320, 160, BLACK);
+      M5.Display.setCursor(0, 80);
+      M5.Display.setTextSize(1);
+      M5.Display.println("Last tag:");
+      M5.Display.println(epc_str.substring(0, 24));
+      
+      Serial.println("Detected: " + epc_str);
+      
+      // Mettre à jour current_tag aussi
+      current_tag.epc_len = epc_str.length() / 2;
+      hexToBytes(epc_str, current_tag.epc, sizeof(current_tag.epc));
+    }
+  }
+  
+  delay(50);  // Petit délai pour éviter la surcharge
+}
+
 // === Interface utilisateur ===
 void displayStatus(const String& line1, const String& line2 = "", const String& line3 = "", const String& line4 = "", const String& line5 = "") {
   M5.Display.fillScreen(BLACK);
@@ -566,15 +634,51 @@ void setup() {
   // Mode "need select" (optionnel - commenter si problème)
   // setSelectMode(0x01);  // 0x00=pas de select requis, 0x01=select requis
   
-  displayStatus("UHF Ready", "A: Scan", "B: Write 96b", "C: Write Auto");
+  displayStatus("UHF Ready", "A: Scan", "A long: Continuous", "B: Write 96b", "C: Write Auto");
 }
 
 // === Main loop ===
 void loop() {
   M5.update();
   
-  // Bouton A : Scan et analyse
-  if (M5.BtnA.wasPressed()) {
+  // === Gestion du mode scan continu (appui long sur A) ===
+  
+  // Détecter début/fin appui long
+  if (M5.BtnA.isPressed()) {
+    if (button_press_start == 0) {
+      button_press_start = millis();
+      button_was_long_pressed = false;
+    } else if (!button_was_long_pressed && millis() - button_press_start > LONG_PRESS_DURATION) {
+      // Appui long détecté - basculer le mode continu
+      button_was_long_pressed = true;
+      continuous_scan_active = !continuous_scan_active;
+      
+      if (continuous_scan_active) {
+        displayStatus("CONTINUOUS SCAN", "Active...", "Press A long to stop");
+        if (startContinuousInventory()) {
+          M5.Speaker.tone(1000, 200, 0, false);  // Bip de démarrage
+          Serial.println("=== CONTINUOUS SCAN STARTED ===");
+        } else {
+          continuous_scan_active = false;
+          displayStatus("ERROR", "Failed to start", "continuous mode");
+        }
+      } else {
+        stopMultiInv(Serial2);
+        displayStatus("CONTINUOUS SCAN", "Stopped", "Back to normal mode");
+        M5.Speaker.tone(800, 200, 0, false);  // Bip d'arrêt
+        Serial.println("=== CONTINUOUS SCAN STOPPED ===");
+      }
+    }
+  } else {
+    button_press_start = 0;
+    button_was_long_pressed = false;
+  }
+  
+  // Traitement du mode continu
+  processContinuousScan();
+  
+  // === Mode scan simple (appui court) - CONSERVÉ IDENTIQUE ===
+  if (M5.BtnA.wasPressed() && !button_was_long_pressed && !continuous_scan_active) {
     stopMultiInv(Serial2);
     uint8_t n = uhf.pollingOnce();
     
@@ -611,6 +715,13 @@ void loop() {
   
   // Bouton B : Write 96 bits fixe
   if (M5.BtnB.wasPressed()) {
+    // Arrêter le mode continu si actif
+    if (continuous_scan_active) {
+      continuous_scan_active = false;
+      stopMultiInv(Serial2);
+      displayStatus("Continuous stopped", "Switching to write mode");
+      delay(1000);
+    }
     if (current_tag.epc_len == 0) {
       displayStatus("Error", "Scan first!");
       return;
@@ -726,6 +837,13 @@ void loop() {
   
   // Bouton C : Write auto-length
   if (M5.BtnC.wasPressed()) {
+    // Arrêter le mode continu si actif
+    if (continuous_scan_active) {
+      continuous_scan_active = false;
+      stopMultiInv(Serial2);
+      displayStatus("Continuous stopped", "Switching to write mode");
+      delay(1000);
+    }
     if (current_tag.epc_len == 0) {
       displayStatus("Error", "Scan first!");
       return;
