@@ -37,9 +37,6 @@ ContinuousTag continuous_tags[MAX_CONTINUOUS_TAGS];
 uint8_t continuous_tags_count = 0;
 uint32_t last_display_update = 0;
 
-// === Variables pour gestion TX Power ===
-uint8_t current_power_index = 1;  // Index power (0=20dBm, 1=26dBm, 2=30dBm)
-
 // === Codes d'erreur ===
 enum WriteError {
   WRITE_OK = 0,
@@ -539,29 +536,6 @@ static bool setSelectMode(uint8_t mode) {
   return sendCmdRaw(frame, i, resp, rlen, 200) && resp[2] == 0x12;
 }
 
-// === Fonctions de gestion TX Power ===
-
-// Obtenir le power actuel en texte
-static const char* getCurrentPowerText() {
-  const char* power_names[] = {"20dBm", "26dBm", "30dBm"};
-  return power_names[current_power_index];
-}
-
-// Cycle TX Power : 20dBm → 26dBm → 30dBm → 20dBm
-static void cycleTxPower() {
-  const uint16_t powers[] = {2000, 2600, 3000};  // 20, 26, 30 dBm
-  const char* power_names[] = {"20dBm", "26dBm", "30dBm"};
-  
-  current_power_index = (current_power_index + 1) % 3;
-  uint16_t new_power = powers[current_power_index];
-  
-  uhf.setTxPower(new_power);
-  
-  // Bip de confirmation + feedback
-  M5.Speaker.tone(1200 + (current_power_index * 300), 80, 0, false);
-  Serial.printf("TX Power cycled to: %s\n", power_names[current_power_index]);
-}
-
 // === Fonctions pour le mode scan continu ===
 
 // Bip court et discret
@@ -699,9 +673,9 @@ static void updateMultiTagDisplay() {
   M5.Display.setTextSize(2);
   M5.Display.setTextColor(WHITE);
   
-  // En-tête avec nombre de tags et power
-  M5.Display.printf("CONTINUOUS [%d] %s\n", continuous_tags_count, getCurrentPowerText());
-  M5.Display.println("A:stop B:power C:exit");
+  // En-tête
+  M5.Display.printf("CONTINUOUS [%d]\n", continuous_tags_count);
+  M5.Display.println("Press A long to stop");
   
   // Ligne de séparation
   M5.Display.drawLine(0, 45, 320, 45, WHITE);
@@ -875,10 +849,12 @@ void loop() {
   
   // Bouton B : Write 96 bits fixe
   if (M5.BtnB.wasPressed()) {
-    // En mode continu : Cycle TX Power au lieu d'arrêter
+    // Arrêter le mode continu si actif
     if (continuous_scan_active) {
-      cycleTxPower();
-      return;  // Ne pas continuer vers l'écriture
+      continuous_scan_active = false;
+      stopMultiInv(Serial2);
+      displayStatus("Continuous stopped", "Switching to write mode");
+      delay(1000);
     }
     if (current_tag.epc_len == 0) {
       displayStatus("Error", "Scan first!");
@@ -995,15 +971,12 @@ void loop() {
   
   // Bouton C : Write auto-length
   if (M5.BtnC.wasPressed()) {
-    // En mode continu : Sortir du mode continu
+    // Arrêter le mode continu si actif
     if (continuous_scan_active) {
       continuous_scan_active = false;
       stopMultiInv(Serial2);
-      displayStatus("Continuous stopped", "Ready for normal mode");
-      M5.Speaker.tone(800, 200, 0, false);
-      delay(1500);
-      displayStatus("UHF Ready", "A: Scan", "A long: Continuous", "B: Write 96b", "C: Write Auto");
-      return;
+      displayStatus("Continuous stopped", "Switching to write mode");
+      delay(1000);
     }
     if (current_tag.epc_len == 0) {
       displayStatus("Error", "Scan first!");
