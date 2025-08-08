@@ -508,23 +508,37 @@ static bool readPcWord(uint16_t& out_pc, uint32_t accessPwd = ACCESS_PWD) {
   frame[i++] = 0x7E;
 
   uint8_t resp[64]; size_t rlen = sizeof(resp);
-  if (!sendCmdRaw(frame, i, resp, rlen)) return false;
-  if (resp[2] != 0x39) return false;
+  if (!sendCmdRaw(frame, i, resp, rlen)) {
+    Serial.println("[DEBUG] readPcWord: sendCmdRaw failed");
+    return false;
+  }
+  if (resp[2] != 0x39) {
+    Serial.printf("[DEBUG] readPcWord: bad cmd response 0x%02X (expected 0x39)\n", resp[2]);
+    return false;
+  }
 
   // Deux formats possibles : DATA only (PL==2) ou UL+DATA
   uint16_t pl = (resp[3] << 8) | resp[4];
+  Serial.printf("[DEBUG] readPcWord: PL=%u, rlen=%u\n", pl, rlen);
+  
   if (pl == 2) {
     out_pc = (uint16_t(resp[5]) << 8) | resp[6];
+    Serial.printf("[DEBUG] readPcWord: DATA only format, PC=0x%04X\n", out_pc);
     return true;
   }
   if (pl >= 3) {
     uint8_t ul = resp[5];
     size_t off = 6 + ul;
+    Serial.printf("[DEBUG] readPcWord: UL+DATA format, UL=%u, off=%u\n", ul, off);
     if (off + 2 <= rlen - 2) {
       out_pc = (uint16_t(resp[off]) << 8) | resp[off + 1];
+      Serial.printf("[DEBUG] readPcWord: PC=0x%04X\n", out_pc);
       return true;
+    } else {
+      Serial.printf("[DEBUG] readPcWord: offset too large (%u + 2 > %u)\n", off, rlen - 2);
     }
   }
+  Serial.printf("[DEBUG] readPcWord: unexpected PL=%u\n", pl);
   return false;
 }
 
@@ -535,15 +549,21 @@ static WriteError writeEpcWithPc(const uint8_t* epc, size_t epc_bytes, uint32_t 
 
   // 1) Lire PC existant et en extraire les flags bas
   uint16_t old_pc = 0;
-  if (!readPcWord(old_pc, accessPwd)) {
-    Serial.println("[PC] read failed");
-    return WRITE_UNKNOWN_ERROR;
+  const uint16_t new_words = epc_bytes / 2;
+  uint16_t pc_word;
+  
+  if (readPcWord(old_pc, accessPwd)) {
+    // Préserver les flags bas si lecture réussie
+    const uint16_t lower_flags = (old_pc & 0x07FF);
+    pc_word = uint16_t((new_words << 11) | lower_flags);
+    Serial.printf("[PC] Preserved flags: old=0x%04X new=0x%04X (words=%u)\n", old_pc, pc_word, new_words);
+  } else {
+    // Fallback vers l'ancienne méthode si lecture échoue
+    Serial.println("[PC] Read failed, using fallback PC calculation");
+    uint16_t protocol_bits = (epc_bytes == 12) ? 0x3000 : 0x0800;
+    pc_word = (new_words << 11) | protocol_bits;
+    Serial.printf("[PC] Fallback: PC=0x%04X (words=%u, protocol=0x%04X)\n", pc_word, new_words, protocol_bits);
   }
-  const uint16_t lower_flags = (old_pc & 0x07FF);      // conserve XPC/ISO/etc.
-  const uint16_t new_words   = epc_bytes / 2;
-  const uint16_t pc_word     = uint16_t((new_words << 11) | lower_flags);
-
-  Serial.printf("[PC] old=0x%04X  new=0x%04X  (words=%u)\n", old_pc, pc_word, new_words);
   
   // Vérification puissance pour EPC > 96-bit
   if (epc_bytes > 12 && current_power_index < 2) {
