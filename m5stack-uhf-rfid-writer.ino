@@ -373,59 +373,6 @@ static bool selectByEpcRaw(const uint8_t* epc, size_t epc_len) {
   return result && resp[2] == 0x0C;
 }
 
-// === Probe de capacité EPC ===
-static size_t probeEpcCapacity(uint32_t accessPwd = 0) {
-  stopMultiInv(Serial2);
-  
-  // Essayer de lire différentes longueurs
-  const size_t word_counts[] = {6, 8, 12, 16, 24, 31};  // 96, 128, 192, 256, 384, 496 bits
-  size_t last_valid = 6;
-  
-  for (size_t wc : word_counts) {
-    uint8_t frame[32];
-    size_t i = 0;
-    
-    frame[i++] = 0xBB;
-    frame[i++] = 0x00;
-    frame[i++] = 0x39;  // READ
-    frame[i++] = 0x00;
-    frame[i++] = 0x09;  // PL = 9
-    
-    // AccessPwd
-    frame[i++] = (accessPwd >> 24);
-    frame[i++] = (accessPwd >> 16);
-    frame[i++] = (accessPwd >> 8);
-    frame[i++] = accessPwd;
-    
-    frame[i++] = 0x01;  // Bank = EPC
-    frame[i++] = 0x00;
-    frame[i++] = 0x02;  // WordPtr = 2 (début EPC)
-    frame[i++] = (wc >> 8);
-    frame[i++] = (wc & 0xFF);
-    
-    uint8_t cs = cs8(&frame[1], i - 1);
-    frame[i++] = cs;
-    frame[i++] = 0x7E;
-    
-    uint8_t resp[512];
-    size_t rlen = sizeof(resp);
-    
-    if (sendCmdRaw(frame, i, resp, rlen, 300)) {
-      if (resp[2] == 0x39) {
-        last_valid = wc;
-        Serial.printf("Probe: %d words OK\n", wc);
-      } else if (resp[2] == 0xFF) {
-        uint8_t err = (rlen > 5) ? resp[5] : 0xFF;
-        if (err == 0x09 || err == 0xA3) {
-          Serial.printf("Probe: %d words -> limit reached (0x%02X)\n", wc, err);
-          break;
-        }
-      }
-    }
-  }
-  
-  return last_valid * 2;  // Retourner en octets
-}
 
 // === Écriture PC word ===
 static bool writePcWord(uint16_t pc_word, uint32_t accessPwd) {
@@ -491,83 +438,29 @@ static bool writePcWord(uint16_t pc_word, uint32_t accessPwd) {
 }
 
 
-// === WRITE EPC avec gestion PC ===
-// --- Remplacement : writeEpcWithPc en préservant les flags bas du PC ---
+// === WRITE EPC 96-bit SEULEMENT ===
 static WriteError writeEpcWithPc(const uint8_t* epc, size_t epc_bytes, uint32_t accessPwd) {
-  if (!epc || epc_bytes == 0 || (epc_bytes & 1)) return WRITE_UNKNOWN_ERROR;
-
-  // 1) Lire PC existant et en extraire les flags bas
-  uint16_t old_pc = 0;
-  const uint16_t new_words = epc_bytes / 2;
-  uint16_t pc_word;
-  
-  if (readPcWord(old_pc, accessPwd)) {
-    uint16_t old_words = (old_pc >> 11) & 0x1F;
-    
-    // PROTECTION CONSERVATRICE: Jamais changer la taille EPC
-    if (old_words != new_words) {
-      Serial.printf("[SAFE] PROTECTION: Tag is %u-words, refusing resize to %u-words to prevent bricking\n", old_words, new_words);
-      Serial.printf("[SAFE] Will write %u-word EPC in existing %u-word space\n", old_words, old_words);
-      // Forcer la taille existante
-      const_cast<uint16_t&>(new_words) = old_words;
-      epc_bytes = old_words * 2;
-    }
-    
-    // Préserver les flags bas si lecture réussie
-    const uint16_t lower_flags = (old_pc & 0x07FF);
-    pc_word = uint16_t((new_words << 11) | lower_flags);
-    Serial.printf("[PC] SAFE: old=0x%04X new=0x%04X (words=%u, same size)\n", old_pc, pc_word, new_words);
-  } else {
-    // Fallback vers l'ancienne méthode si lecture échoue
-    Serial.println("[PC] Read failed, using fallback PC calculation");
-    uint16_t protocol_bits = (epc_bytes == 12) ? 0x3000 : 0x0800;
-    pc_word = (new_words << 11) | protocol_bits;
-    Serial.printf("[PC] Fallback: PC=0x%04X (words=%u, protocol=0x%04X)\n", pc_word, new_words, protocol_bits);
+  // Forcer 96-bit seulement
+  if (epc_bytes != 12) {
+    Serial.printf("ERROR: Only 96-bit EPC supported, got %u bytes\n", epc_bytes);
+    return WRITE_MEMORY_OVERRUN;
   }
   
-  // Vérification puissance pour EPC > 96-bit
-  if (epc_bytes > 12 && current_power_index < 2) {
-    Serial.printf("WARNING: %u-bit EPC write needs max power (30dBm). Current: %s\n", 
-                  epc_bytes * 8, getCurrentPowerText());
-    Serial.println("Try cycling power with Button C in continuous mode first.");
-  }
+  // PC word fixe pour 96-bit
+  uint16_t pc_word = 0x3000;
+  Serial.printf("Writing 96-bit EPC, PC=0x%04X\n", pc_word);
   
-  // 2) (optionnel mais utile) tester lecture de la future taille EPC
-  //    Si le tag ne supporte pas autant de mots, la lecture échouera.
-  auto canReadFutureEPC = [&](uint16_t words)->bool {
-    // READ EPC bank from word=2, DL=words
-    uint8_t frame[32]; size_t i = 0;
-    frame[i++] = 0xBB; frame[i++] = 0x00; frame[i++] = 0x39;
-    frame[i++] = 0x00; frame[i++] = 0x09;
-    frame[i++] = (accessPwd >> 24); frame[i++] = (accessPwd >> 16);
-    frame[i++] = (accessPwd >> 8);  frame[i++] = accessPwd;
-    frame[i++] = 0x01;                   // EPC
-    frame[i++] = 0x00; frame[i++] = 0x02;// WordPtr = 2 (début EPC)
-    frame[i++] = (words >> 8); frame[i++] = (words & 0xFF);
-    frame[i++] = cs8(&frame[1], i - 1);
-    frame[i++] = 0x7E;
-    uint8_t resp[512]; size_t rlen = sizeof(resp);
-    if (!sendCmdRaw(frame, i, resp, rlen)) return false;
-    if (resp[2] != 0x39) return false;
-    // On ne valide pas le contenu, juste que la lecture "passe"
-    return true;
-  };
-
-  if (!canReadFutureEPC(new_words)) {
-    Serial.println("[EPC] Tag likely not large enough for requested length");
-    return WRITE_MEMORY_OVERRUN;  // plus parlant que UNKNOWN
-  }
-
-  // 3) Écrire le PC (préservant les flags bas)
+  // 1. Écrire le PC word
   if (!writePcWord(pc_word, accessPwd)) {
-    Serial.println("[PC] write failed");
+    Serial.println("Failed to write PC word");
     return WRITE_UNKNOWN_ERROR;
   }
-  delay(20);
-
-  // 4) Écrire l'EPC (bank EPC, wordPtr=2)
-  uint16_t pl = 9 + epc_bytes;
-  uint8_t buf[128];
+  
+  delay(50);
+  
+  // 2. Écrire l'EPC
+  uint16_t pl = 9 + 12;  // 9 + 12 bytes EPC
+  uint8_t buf[32];
   size_t i = 0;
   
   buf[i++] = 0xBB;
@@ -585,73 +478,30 @@ static WriteError writeEpcWithPc(const uint8_t* epc, size_t epc_bytes, uint32_t 
   buf[i++] = 0x01;  // Bank = EPC
   buf[i++] = 0x00;
   buf[i++] = 0x02;  // WordPtr = 2 (début EPC)
-  buf[i++] = (new_words >> 8);
-  buf[i++] = (new_words & 0xFF);
+  buf[i++] = 0x00;
+  buf[i++] = 0x06;  // 6 words (96-bit)
   
-  memcpy(&buf[i], epc, epc_bytes);
-  i += epc_bytes;
+  memcpy(&buf[i], epc, 12);
+  i += 12;
   
-  // CS + 0x7E
-  buf[i++] = cs8(&buf[1], i - 1);  // Correction checksum
+  uint8_t cs = cs8(&buf[1], i - 1);
+  buf[i++] = cs;
   buf[i++] = 0x7E;
-
-  uint8_t resp[256]; size_t rlen = sizeof(resp);
+  
+  uint8_t resp[64];
+  size_t rlen = sizeof(resp);
+  
   if (!sendCmdRaw(buf, i, resp, rlen)) {
-    Serial.println("[EPC] write failed (no frame/timeout)");
     return WRITE_UNKNOWN_ERROR;
   }
-  if (resp[2] != 0x49) {
-    Serial.printf("[EPC] write NACK cmd=0x%02X\n", resp[2]);
-    if (resp[2] == 0xFF && rlen > 5) return parseWriteError(resp[5]);
-    return WRITE_UNKNOWN_ERROR;
+  
+  if (resp[2] == 0x49) {
+    return WRITE_OK;
+  } else if (resp[2] == 0xFF && rlen > 5) {
+    return parseWriteError(resp[5]);
   }
-
-  delay(30);
-
-  // 5) Vérifier en relisant l'EPC (banque 1, word=2, DL=new_words)
-  {
-    // READ EPC bank (word 2)
-    uint8_t frame[32]; size_t j = 0;
-    frame[j++] = 0xBB; frame[j++] = 0x00; frame[j++] = 0x39;
-    frame[j++] = 0x00; frame[j++] = 0x09;
-    frame[j++] = (accessPwd >> 24); frame[j++] = (accessPwd >> 16);
-    frame[j++] = (accessPwd >> 8);  frame[j++] = accessPwd;
-    frame[j++] = 0x01;                    // EPC
-    frame[j++] = 0x00; frame[j++] = 0x02; // WordPtr = 2
-    frame[j++] = (new_words >> 8); frame[j++] = (new_words & 0xFF);
-    frame[j++] = cs8(&frame[1], j - 1);
-    frame[j++] = 0x7E;
-
-    uint8_t r2[512]; size_t l2 = sizeof(r2);
-    if (!sendCmdRaw(frame, j, r2, l2)) {
-      Serial.println("[VERIFY] read EPC failed");
-      return WRITE_UNKNOWN_ERROR;
-    }
-    if (r2[2] != 0x39) {
-      Serial.println("[VERIFY] bad cmd");
-      return WRITE_UNKNOWN_ERROR;
-    }
-
-    // Extraire data (format DATA only ou UL+DATA)
-    uint16_t pl2 = (r2[3] << 8) | r2[4];
-    const uint8_t* data = nullptr; size_t data_len = 0;
-
-    if (pl2 == epc_bytes) {  // DATA only
-      data = &r2[5]; data_len = epc_bytes;
-    } else if (pl2 >= (1 + epc_bytes)) {
-      uint8_t ul = r2[5]; size_t off = 6 + ul;
-      if (off + epc_bytes <= l2 - 2) {
-        data = &r2[off]; data_len = epc_bytes;
-      }
-    }
-
-    if (!data || data_len != epc_bytes || memcmp(epc, data, epc_bytes) != 0) {
-      Serial.println("[VERIFY] EPC mismatch");
-      return WRITE_UNKNOWN_ERROR;
-    }
-  }
-
-  return WRITE_OK;
+  
+  return WRITE_UNKNOWN_ERROR;
 }
 
 
@@ -985,7 +835,7 @@ void setup() {
   // Mode "need select" (optionnel - commenter si problème)
   // setSelectMode(0x01);  // 0x00=pas de select requis, 0x01=select requis
   
-  displayStatus("UHF Ready", "A: Scan | A long: Continuous", "B: Write 96b", "C: Write Auto", "C long: Restore");
+  displayStatus("UHF Ready", "A: Scan | A long: Continuous", "B: Write 96b");
 }
 
 // === Main loop ===
@@ -1047,16 +897,12 @@ void loop() {
     if (uhf.select(uhf.cards[0].epc)) {
       current_tag.has_tid = readTid(current_tag.tid);
       
-      // Probe capacity
-      size_t capacity = probeEpcCapacity(ACCESS_PWD);
-      
       String tid_str = current_tag.has_tid ? bytesToHex(current_tag.tid, 8) : "N/A";
       
       displayStatus(
       "Tag found",
-      "EPC lenght: " + String(current_tag.epc_len * 8) + "b",
+      "EPC length: " + String(current_tag.epc_len * 8) + "b",
       "EPC data: " + String(epc_str),
-      "Cap: " + String(capacity * 8) + "b",
       "TID: " + tid_str.substring(0, 16)
       );
     } else {
@@ -1178,179 +1024,6 @@ void loop() {
     } else {
       displayStatus("Write fail", errorToString(err));
       Serial.println("Write failed with error: " + String(errorToString(err)));
-    }
-  }
-  
-  // Bouton C long : Restore tag
-  if (M5.BtnC.pressedFor(2000)) {
-    displayStatus("TAG RESTORE", "Attempting recovery...");
-    M5.Speaker.tone(1500, 300, 0, false);
-    
-    bool restored = restoreTag();
-    
-    if (restored) {
-      displayStatus("RESTORE SUCCESS", "Tag recovered!");
-      M5.Speaker.tone(2000, 200, 0, false);
-      delay(200);
-      M5.Speaker.tone(2000, 200, 0, false);
-    } else {
-      displayStatus("RESTORE FAILED", "Tag unrecoverable");
-      M5.Speaker.tone(500, 500, 0, false);
-    }
-    
-    delay(3000);
-    displayStatus("UHF Ready", "A: Scan | A long: Continuous", "B: Write 96b", "C: Write Auto", "C long: Restore");
-    return;
-  }
-
-  // Bouton C : Write auto-length
-  if (M5.BtnC.wasPressed()) {
-    // En mode continu : Sortir du mode continu
-    if (continuous_scan_active) {
-      continuous_scan_active = false;
-      stopMultiInv(Serial2);
-      displayStatus("Continuous stopped", "Ready for normal mode");
-      M5.Speaker.tone(800, 200, 0, false);
-      delay(1500);
-      displayStatus("UHF Ready", "A: Scan | A long: Continuous", "B: Write 96b", "C: Write Auto", "C long: Restore");
-      return;
-    }
-    if (current_tag.epc_len == 0) {
-      displayStatus("Error", "Scan first!");
-      return;
-    }
-    
-    Serial.println("\n=== WRITE AUTO-LENGTH ===");
-    Serial.print("Current EPC: ");
-    for (size_t i = 0; i < current_tag.epc_len; i++) {
-      Serial.printf("%02X ", current_tag.epc[i]);
-    }
-    Serial.printf("\nCurrent length: %d bits\n", current_tag.epc_len * 8);
-    
-    stopMultiInv(Serial2);
-    delay(50);
-    
-    // Probe capacity first
-    size_t capacity = probeEpcCapacity(ACCESS_PWD);
-    Serial.printf("Tag capacity: %d bytes (%d bits)\n", capacity, capacity * 8);
-    
-    // Select avec plusieurs méthodes
-    bool selected = false;
-    
-    // Méthode 1: Select avec la lib
-    selected = uhf.select(current_tag.epc);
-    Serial.println("Select by lib: " + String(selected));
-    
-    if (!selected) {
-      // Méthode 2: Select EPC raw
-      selected = selectByEpcRaw(current_tag.epc, current_tag.epc_len);
-      Serial.println("Select by EPC raw: " + String(selected));
-    }
-    
-    if (!selected && current_tag.has_tid) {
-      // Méthode 3: Select par TID
-      selected = selectByTid(current_tag.tid);
-      Serial.println("Select by TID: " + String(selected));
-    }
-    
-    if (!selected) {
-      // Dernière tentative
-      stopMultiInv(Serial2);
-      delay(100);
-      uint8_t n = uhf.pollingOnce();
-      if (n > 0) {
-        Serial.println("Re-scan found EPC: " + uhf.cards[0].epc_str);
-        selected = uhf.select(uhf.cards[0].epc);
-        Serial.println("Select after poll: " + String(selected));
-      }
-    }
-    
-    if (!selected) {
-      displayStatus("Write fail", "Select error", "Check tag");
-      Serial.println("All select methods failed!");
-      return;
-    }
-    
-    // Générer un EPC aléatoire de la bonne taille
-    uint8_t new_epc[62];
-    size_t new_len = min(capacity, (size_t)24);  // Max 192 bits pour cet exemple
-    
-    // EPC aléatoire adapté à la taille
-    generateRandomEpc(new_epc, new_len);
-    
-    Serial.printf("Writing new EPC: %d bytes (%d bits)\n", new_len, new_len * 8);
-    Serial.print("New EPC bytes: ");
-    for (size_t i = 0; i < new_len; i++) {
-      Serial.printf("%02X ", new_epc[i]);
-    }
-    Serial.println();
-    
-    WriteError err = writeEpcWithPc(new_epc, new_len, ACCESS_PWD);
-    
-    // Fallback : si échec avec INSUFFICIENT_POWER et taille > 96-bit, essayer en 96-bit
-    if (err == WRITE_UNKNOWN_ERROR && new_len > 12) {
-      Serial.println("Extended EPC write failed, trying 96-bit fallback...");
-      new_len = 12;  // Forcer 96-bit
-      generateRandomEpc(new_epc, new_len);  // Nouveau EPC 96-bit
-      Serial.print("Fallback EPC bytes: ");
-      for (size_t i = 0; i < new_len; i++) {
-        Serial.printf("%02X ", new_epc[i]);
-      }
-      Serial.println();
-      err = writeEpcWithPc(new_epc, new_len, ACCESS_PWD);
-    }
-    
-    Serial.println("Write result: " + String(errorToString(err)));
-    
-    String hex_str = bytesToHex(new_epc, min(new_len, (size_t)12));
-    
-    if (err == WRITE_OK) {
-      // Vérifier
-      delay(100);
-      stopMultiInv(Serial2);
-      uint8_t n = uhf.pollingOnce();
-      
-      Serial.println("\nVerification scan:");
-      bool found = false;
-      String target_hex = bytesToHex(new_epc, new_len);
-      target_hex.toUpperCase();
-      
-      for (uint8_t i = 0; i < n; i++) {
-        String s = uhf.cards[i].epc_str;
-        Serial.println("  Found: " + s);
-        s.toUpperCase();
-        if (s == target_hex) {
-          found = true;
-          Serial.println("  -> MATCH! Write successful!");
-        }
-      }
-      
-      if (!found) {
-        Serial.println("  -> New EPC not found in verification");
-      }
-      
-      // Mettre à jour current_tag
-      memcpy(current_tag.epc, new_epc, new_len);
-      current_tag.epc_len = new_len;
-      
-      Serial.println("====================\n");
-    }
-    
-    // Affichage LCD
-    M5.Display.fillScreen(BLACK);
-    M5.Display.setCursor(0, 0);
-    M5.Display.setTextSize(2);
-    M5.Display.printf("Write %db\n", new_len * 8);
-    M5.Display.println(errorToString(err));
-    
-    M5.Display.setTextSize(1);
-    M5.Display.println();
-    M5.Display.println("New EPC:");
-    // Afficher par lignes
-    for (size_t i = 0; i < new_len; i += 12) {
-      size_t len = min((size_t)12, new_len - i);
-      String line = bytesToHex(&new_epc[i], len);
-      M5.Display.println(line);
     }
   }
 }
