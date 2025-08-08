@@ -652,7 +652,7 @@ static bool selectByTid(const uint8_t tid[8]) {
 
 // === Select par EPC format raw (alternative) ===
 static bool selectByEpcRaw(const uint8_t* epc, size_t epc_len) {
-  uint8_t frame[64];
+  uint8_t frame[96];
   size_t i = 0;
   
   frame[i++] = 0xBB;
@@ -1281,9 +1281,9 @@ static void processContinuousScan() {
       
       // Récupérer TID si possible pour chaque tag
       String tid_str = "N/A";
-      uint8_t epc_bytes[31];
+      uint8_t epc_bytes[62];
       size_t epc_len = epc_str.length() / 2;
-      if (hexToBytes(epc_str, epc_bytes, 31)) {
+      if (hexToBytes(epc_str, epc_bytes, 62)) {
         if (rawSelect(epc_bytes, epc_len)) {
           uint8_t tid_buf[8];
           if (readTid(tid_buf)) {
@@ -1329,8 +1329,8 @@ static void updateMultiTagDisplay() {
     for (uint8_t i = 0; i < continuous_tags_count; i++) {
       // Tronquer l'EPC si nécessaire pour l'affichage
       String display_epc = continuous_tags[i].epc;
-      if (display_epc.length() > 26) {
-        display_epc = display_epc.substring(0, 24) + "..";
+      if (display_epc.length() > 38) {
+        display_epc = display_epc.substring(0, 36) + "..";
       }
       
       // Utiliser DisplayManager pour l'affichage unifié
@@ -1475,7 +1475,7 @@ void loop() {
       displayStatus(
       "Tag found",
       "EPC: " + String(current_tag.epc_len * 8) + "b RSSI: " + String(raw_tags[0].rssi_dbm) + "dBm",
-      "Data: " + String(epc_str.substring(0, 24)),
+      "Data: " + String(epc_str.length() > 36 ? epc_str.substring(0, 36) + ".." : epc_str),
       "TID: " + tid_str.substring(0, 16)
       );
     } else {
@@ -1532,8 +1532,8 @@ void loop() {
       uint8_t n = rawInventoryWithRssi(rescan_tags, 1);
       if (n > 0) {
         Serial.println("Re-scan found EPC: " + rescan_tags[0].epc);
-        uint8_t epc_bytes[31];
-        if (hexToBytes(rescan_tags[0].epc, epc_bytes, 31)) {
+        uint8_t epc_bytes[62];
+        if (hexToBytes(rescan_tags[0].epc, epc_bytes, 62)) {
           size_t epc_len = rescan_tags[0].epc.length() / 2;
           selected = rawSelect(epc_bytes, epc_len);
           Serial.println("Select after poll: " + String(selected));
