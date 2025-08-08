@@ -552,35 +552,40 @@ static WriteError writeEpcWithPc(const uint8_t* epc, size_t epc_bytes, uint32_t 
     Serial.println("Try cycling power with Button C in continuous mode first.");
   }
   
-  // 1. Écrire le PC word
-  if (!writePcWord(pc_word, accessPwd)) {
-    Serial.printf("Failed to write PC word 0x%04X for %u-bit EPC\n", pc_word, epc_bytes * 8);
-    
-    // Fallback pour 96-bit : essayer 0x3008 si 0x3000 échoue
-    if (epc_bytes == 12 && protocol_bits == 0x3000) {
-      Serial.println("Trying alternative PC word 0x3008...");
-      uint16_t alt_pc = (epc_words << 11) | 0x3008;
-      if (writePcWord(alt_pc, accessPwd)) {
-        Serial.printf("Alternative PC write success: PC=0x%04X\n", alt_pc);
-        pc_word = alt_pc;  // Utiliser le PC alternatif pour la suite
-      } else {
-        Serial.printf("Alternative PC 0x%04X also failed\n", alt_pc);
-        if (epc_bytes > 12) {
-          Serial.println("Hint: Try max TX power (30dBm) for extended EPC writes");
-        }
-        return WRITE_UNKNOWN_ERROR;
-      }
-    } else {
-      if (epc_bytes > 12) {
-        Serial.println("Hint: Try max TX power (30dBm) for extended EPC writes");
-      }
-      return WRITE_UNKNOWN_ERROR;
-    }
+  // 2) (optionnel mais utile) tester lecture de la future taille EPC
+  //    Si le tag ne supporte pas autant de mots, la lecture échouera.
+  auto canReadFutureEPC = [&](uint16_t words)->bool {
+    // READ EPC bank from word=2, DL=words
+    uint8_t frame[32]; size_t i = 0;
+    frame[i++] = 0xBB; frame[i++] = 0x00; frame[i++] = 0x39;
+    frame[i++] = 0x00; frame[i++] = 0x09;
+    frame[i++] = (accessPwd >> 24); frame[i++] = (accessPwd >> 16);
+    frame[i++] = (accessPwd >> 8);  frame[i++] = accessPwd;
+    frame[i++] = 0x01;                   // EPC
+    frame[i++] = 0x00; frame[i++] = 0x02;// WordPtr = 2 (début EPC)
+    frame[i++] = (words >> 8); frame[i++] = (words & 0xFF);
+    frame[i++] = cs8(&frame[1], i - 1);
+    frame[i++] = 0x7E;
+    uint8_t resp[512]; size_t rlen = sizeof(resp);
+    if (!sendCmdRaw(frame, i, resp, rlen)) return false;
+    if (resp[2] != 0x39) return false;
+    // On ne valide pas le contenu, juste que la lecture "passe"
+    return true;
+  };
+
+  if (!canReadFutureEPC(new_words)) {
+    Serial.println("[EPC] Tag likely not large enough for requested length");
+    return WRITE_MEMORY_OVERRUN;  // plus parlant que UNKNOWN
   }
-  
-  delay(50);
-  
-  // 2. Écrire l'EPC
+
+  // 3) Écrire le PC (préservant les flags bas)
+  if (!writePcWord(pc_word, accessPwd)) {
+    Serial.println("[PC] write failed");
+    return WRITE_UNKNOWN_ERROR;
+  }
+  delay(20);
+
+  // 4) Écrire l'EPC (bank EPC, wordPtr=2)
   uint16_t pl = 9 + epc_bytes;
   uint8_t buf[128];
   size_t i = 0;
@@ -600,35 +605,73 @@ static WriteError writeEpcWithPc(const uint8_t* epc, size_t epc_bytes, uint32_t 
   buf[i++] = 0x01;  // Bank = EPC
   buf[i++] = 0x00;
   buf[i++] = 0x02;  // WordPtr = 2 (début EPC)
-  buf[i++] = (epc_words >> 8);
-  buf[i++] = (epc_words & 0xFF);
+  buf[i++] = (new_words >> 8);
+  buf[i++] = (new_words & 0xFF);
   
   memcpy(&buf[i], epc, epc_bytes);
   i += epc_bytes;
   
-  uint8_t cs = cs8(&buf[1], 4 + pl);
-  buf[i++] = cs;
+  // CS + 0x7E
+  buf[i++] = cs8(&buf[1], i - 1);  // Correction checksum
   buf[i++] = 0x7E;
-  
-  uint8_t resp[256];
-  size_t rlen = sizeof(resp);
-  
+
+  uint8_t resp[256]; size_t rlen = sizeof(resp);
   if (!sendCmdRaw(buf, i, resp, rlen)) {
+    Serial.println("[EPC] write failed (no frame/timeout)");
     return WRITE_UNKNOWN_ERROR;
   }
-  
-  // Analyser la réponse
-  if (resp[2] == 0x49) {
-    // Chercher le paramètre de statut (avant CS)
-    if (rlen >= 3 && resp[rlen-3] == 0x00) {
-      return WRITE_OK;
+  if (resp[2] != 0x49) {
+    Serial.printf("[EPC] write NACK cmd=0x%02X\n", resp[2]);
+    if (resp[2] == 0xFF && rlen > 5) return parseWriteError(resp[5]);
+    return WRITE_UNKNOWN_ERROR;
+  }
+
+  delay(30);
+
+  // 5) Vérifier en relisant l'EPC (banque 1, word=2, DL=new_words)
+  {
+    // READ EPC bank (word 2)
+    uint8_t frame[32]; size_t j = 0;
+    frame[j++] = 0xBB; frame[j++] = 0x00; frame[j++] = 0x39;
+    frame[j++] = 0x00; frame[j++] = 0x09;
+    frame[j++] = (accessPwd >> 24); frame[j++] = (accessPwd >> 16);
+    frame[j++] = (accessPwd >> 8);  frame[j++] = accessPwd;
+    frame[j++] = 0x01;                    // EPC
+    frame[j++] = 0x00; frame[j++] = 0x02; // WordPtr = 2
+    frame[j++] = (new_words >> 8); frame[j++] = (new_words & 0xFF);
+    frame[j++] = cs8(&frame[1], j - 1);
+    frame[j++] = 0x7E;
+
+    uint8_t r2[512]; size_t l2 = sizeof(r2);
+    if (!sendCmdRaw(frame, j, r2, l2)) {
+      Serial.println("[VERIFY] read EPC failed");
+      return WRITE_UNKNOWN_ERROR;
     }
-    return WRITE_UNKNOWN_ERROR;
-  } else if (resp[2] == 0xFF && rlen > 5) {
-    return parseWriteError(resp[5]);
+    if (r2[2] != 0x39) {
+      Serial.println("[VERIFY] bad cmd");
+      return WRITE_UNKNOWN_ERROR;
+    }
+
+    // Extraire data (format DATA only ou UL+DATA)
+    uint16_t pl2 = (r2[3] << 8) | r2[4];
+    const uint8_t* data = nullptr; size_t data_len = 0;
+
+    if (pl2 == epc_bytes) {  // DATA only
+      data = &r2[5]; data_len = epc_bytes;
+    } else if (pl2 >= (1 + epc_bytes)) {
+      uint8_t ul = r2[5]; size_t off = 6 + ul;
+      if (off + epc_bytes <= l2 - 2) {
+        data = &r2[off]; data_len = epc_bytes;
+      }
+    }
+
+    if (!data || data_len != epc_bytes || memcmp(epc, data, epc_bytes) != 0) {
+      Serial.println("[VERIFY] EPC mismatch");
+      return WRITE_UNKNOWN_ERROR;
+    }
   }
-  
-  return WRITE_UNKNOWN_ERROR;
+
+  return WRITE_OK;
 }
 
 // === Hex utilities ===
