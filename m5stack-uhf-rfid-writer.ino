@@ -49,22 +49,6 @@ bool button_was_long_pressed = false;
 String last_detected_epc = "";
 uint32_t last_beep_time = 0;
 
-// === Mode EPC cyclique (bouton B) ===
-enum EpcWriteMode {
-  EPC_96BIT = 0,
-  EPC_128BIT = 1,
-  EPC_MODE_COUNT = 2
-};
-static EpcWriteMode current_epc_mode = EPC_96BIT;
-
-// Fonction pour obtenir le texte du mode EPC actuel
-static const char* getEpcModeText() {
-  switch (current_epc_mode) {
-    case EPC_96BIT:  return "B: Write 96b";
-    case EPC_128BIT: return "B: Write 128b";
-    default:         return "B: Write var";
-  }
-}
 
 
 // === Structure pour multi-tags en continu ===
@@ -211,6 +195,24 @@ void displayStatus(const String& line1, const String& line2 = "", const String& 
 
 // === Variables pour gestion TX Power ===
 uint8_t current_power_index = 1;  // Index power (0=20dBm, 1=26dBm, 2=30dBm)
+
+// === Cible longueur EPC en words (16 bits/word) ===
+static uint8_t g_target_words = 6;  // 6=96b par défaut
+
+// Texte UI pour le mode actuel (ex: "B: Write 8w (128b)")
+static String getEpcWordsText() {
+  return String("B: Write ") + String(g_target_words) + "w (" + String(g_target_words * 16) + "b)";
+}
+
+// Cycle 6→7→8→…→31→6
+static void cycleEpcWords() {
+  g_target_words++;
+  if (g_target_words < 6 || g_target_words > 31) g_target_words = 6;
+  Serial.printf("🔄 Target EPC length: %u words (%u bits)\n", g_target_words, g_target_words * 16);
+  displayStatus("Mode Changed", getEpcWordsText(), "Ready to write");
+  delay(1200);
+  displayStatus("UHF Ready", "A: Scan | A long: Continuous", getEpcWordsText());
+}
 
 
 // === Structure pour stocker les infos d'un tag ===
@@ -1152,6 +1154,7 @@ static WriteError writeEpcVariableSafe(const uint8_t* epc, size_t epc_bytes, uin
       Serial.println("⚠️ PC write failed, continuing anyway");
       // si PC word refuse, on tente quand même l'écriture EPC (certains firmwares le mettent à jour eux-mêmes)
     }
+    delay(5); // laisse respirer le tag avant l'écriture EPC
 
     // 2) Construire et envoyer WRITE EPC (Bank=EPC, WordPtr=2)
     const uint8_t word_count = words_target;
@@ -1193,6 +1196,8 @@ static WriteError writeEpcVariableSafe(const uint8_t* epc, size_t epc_bytes, uin
       // succès
       Serial.printf("✅ SUCCESS: EPC written at %u words (%u bits)\n", words_target, words_target * 16);
       Serial.println("==================================================");
+      // synchroniser l'UI avec la longueur réellement écrite
+      g_target_words = words_target;
       return WRITE_OK;
     }
     if (resp[2] == 0xFF && rlen > 5) {
@@ -1516,15 +1521,6 @@ static void updateMultiTagDisplay() {
 // === Fonctions pour gestion mode EPC cyclique ===
 
 // Fonction pour cycler entre les modes EPC
-static void cycleEpcMode() {
-  current_epc_mode = static_cast<EpcWriteMode>((current_epc_mode + 1) % EPC_MODE_COUNT);
-  Serial.printf("🔄 Mode switched to: %s\n", getEpcModeText());
-  
-  // Mettre à jour l'affichage
-  displayStatus("Mode Changed", getEpcModeText(), "Ready to write");
-  delay(1500); // Afficher le changement pendant 1.5s
-  displayStatus("UHF Ready", "A: Scan | A long: Continuous", getEpcModeText());
-}
 
 // Fonction pour effectuer l'écriture selon le mode actuel
 static void performEpcWrite() {
@@ -1553,24 +1549,11 @@ static void performEpcWrite() {
     return;
   }
   
-  // Générer EPC selon le mode
-  uint8_t new_epc[32]; // Buffer suffisant pour 128-bit (16 bytes)
-  size_t target_len;
-  
-  switch (current_epc_mode) {
-    case EPC_96BIT:
-      target_len = 12; // 96 bits = 12 bytes
-      Serial.println("=== WRITE 96-BIT RANDOM EPC ===");
-      break;
-    case EPC_128BIT:
-      target_len = 16; // 128 bits = 16 bytes
-      Serial.println("=== WRITE 128-BIT RANDOM EPC ===");
-      break;
-    default:
-      target_len = current_tag.epc_len; // Variable selon tag scanné
-      Serial.printf("=== WRITE VARIABLE EPC: %u bytes ===\n", target_len);
-      break;
-  }
+  // Générer EPC selon la longueur ciblée (words → bytes)
+  uint8_t new_epc[62]; // max 31 words = 62 bytes
+  const uint8_t target_words = g_target_words;
+  const size_t  target_len   = size_t(target_words) * 2;
+  Serial.printf("=== WRITE RANDOM EPC: %u words (%u bits) ===\n", target_words, target_words * 16);
   
   generateRandomEpc(new_epc, target_len);
   String newEpcHex = bytesToHex(new_epc, target_len);
@@ -1582,9 +1565,8 @@ static void performEpcWrite() {
   Serial.println("Write result: " + String(errorToString(err)));
   
   if (err == WRITE_OK) {
-    // L'état visuel reposera sur le read-back fait par writeEpcVariableSafeWithVerifyRaw()
-    String shown = bytesToHex(current_tag.epc, current_tag.epc_len);
-    DisplayManager::showWriteResult(true, "Verification: READ-BACK OK", "", shown);
+    // Le wrapper a déjà fait un read-back via PC; afficher juste OK + EPC cible
+    DisplayManager::showWriteResult(true, "Write+Readback done", "", newEpcHex);
   } else {
     DisplayManager::showWriteResult(false, errorToString(err), "Check tag position and power");
   }
@@ -1717,7 +1699,7 @@ void setup() {
   // Mode "need select" (optionnel - commenter si problème)
   // setSelectMode(0x01);  // 0x00=pas de select requis, 0x01=select requis
   
-  displayStatus("UHF Ready", "A: Scan | A long: Continuous", getEpcModeText());
+  displayStatus("UHF Ready", "A: Scan | A long: Continuous", getEpcWordsText());
 }
 
 // === Main loop ===
@@ -1850,24 +1832,26 @@ void loop() {
         "EPC: " + String(current_tag.epc_len * 8) + "b RSSI: " + String(raw_tags[0].rssi_dbm) + "dBm",
         "Data: " + String(epc_str.length() > 36 ? epc_str.substring(0, 36) + ".." : epc_str),
         "TID: " + tid_str.substring(0, 16),
-        getEpcModeText()
+        getEpcWordsText()
       );
     } else {
       displayStatus("Scan OK", "Select failed");
     }
   }
   
-  // Bouton B : long press = change mode, short press = write
+  // Bouton B : long press = change longueur EPC (6/7/8/…),
+  // short press = write avec la longueur ciblée.
   // En mode continu, B garde le cycle TX power comme avant.
   if (continuous_scan_active) {
     if (M5.BtnB.wasPressed()) {
       cycleTxPower();
     }
   } else {
-    if (M5.BtnB.pressedFor(800)) {        // ~0.8s pour changer de mode
-      cycleEpcMode();
+    if (M5.BtnB.pressedFor(800)) {        // ~0.8s pour changer la longueur EPC
+      cycleEpcWords();
       // Anti-rebond long press : attendre release avant autre action
       while (M5.BtnB.isPressed()) { M5.update(); delay(5); }
+      return; // <-- évite que le wasReleased() du même cycle déclenche un write
     } else if (M5.BtnB.wasReleased()) {   // Short press → write
       performEpcWrite();
     }
