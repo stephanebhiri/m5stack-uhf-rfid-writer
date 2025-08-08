@@ -6,6 +6,9 @@
 // #include "UNIT_UHF_RFID.h"  // Plus besoin - 100% raw!
 #include "universal_inventory.h"
 
+// Forward declarations
+static const char* getCurrentPowerText();
+
 // === Codes d'erreur ===
 enum WriteError {
   WRITE_OK = 0,
@@ -269,15 +272,12 @@ bool sendCmdRaw(const uint8_t* frame, size_t len, uint8_t* resp, size_t& rlen, u
         }
       } else {
         resp[idx++] = b;
-        // Si on a reçu 0x7E, on a probablement la trame complète
-        if (b == 0x7E && idx >= 7) {
-          // Vérifier que c'est une trame valide
-          if (idx >= 5) {
-            uint16_t pl = (resp[3] << 8) | resp[4];
-            size_t expected_len = 5 + pl + 2;
-            if (idx >= expected_len) {
-              break;  // Trame complète reçue
-            }
+        // Dès que PL est connu, attendre exactement expected_len
+        if (idx >= 5) {
+          uint16_t pl = (resp[3] << 8) | resp[4];
+          size_t expected_len = 5 + pl + 2;
+          if (idx >= expected_len) {
+            break;  // Trame complète reçue
           }
         }
       }
@@ -314,16 +314,15 @@ bool sendCmdRaw(const uint8_t* frame, size_t len, uint8_t* resp, size_t& rlen, u
   return true;
 }
 
-// === Inventory raw avec RSSI - Utilise le parser GPT-5 ===
-static uint8_t rawInventoryWithRssi(RawTagData* tags, uint8_t max_tags) {
-  return rawInventoryWithRssiGPT5(tags, max_tags);
-}
+// Function rawInventoryWithRssi() now directly available from universal_inventory.h
 
 // === SELECT raw en copiant exactement le format M5Stack ===
 static bool rawSelect(const uint8_t* epc, size_t epc_len, uint32_t access_pwd = 0) {
-  if (!epc || epc_len != 12) {  // M5Stack expect exactly 12 bytes EPC
-    Serial.printf("❌ Invalid EPC for M5Stack select: %d bytes (need 12)\n", epc_len);
-    return false;
+  if (!epc || epc_len == 0 || epc_len > 31) return false;
+  
+  if (epc_len != 12) {
+    // Fallback générique si EPC ≠ 96 bits
+    return selectByEpcRaw(epc, epc_len);
   }
   
   // Copier exactement SET_SELECT_PARAMETER_CMD de M5Stack
@@ -1263,7 +1262,7 @@ static void processContinuousScan() {
   
   // Nettoyer les vieux tags de temps en temps
  static uint32_t last_cleanup = 0;
-  if (millis() - last_cleanup > 500) {  // Toutes les 250ms
+  if (millis() - last_cleanup > 500) {  // Toutes les 500ms
     cleanupOldTags();
     last_cleanup = millis();
   }
@@ -1283,8 +1282,9 @@ static void processContinuousScan() {
       // Récupérer TID si possible pour chaque tag
       String tid_str = "N/A";
       uint8_t epc_bytes[31];
+      size_t epc_len = epc_str.length() / 2;
       if (hexToBytes(epc_str, epc_bytes, 31)) {
-        if (rawSelect(epc_bytes, epc_str.length() / 2)) {
+        if (rawSelect(epc_bytes, epc_len)) {
           uint8_t tid_buf[8];
           if (readTid(tid_buf)) {
             tid_str = bytesToHex(tid_buf, 8).substring(0, 8); // Premier 8 chars du TID
@@ -1375,7 +1375,7 @@ void setup() {
     // info = uhf.getVersion();  // Remplacé par test raw
     // Test basique avec inventory
     RawTagData test_tags[1];
-    if (rawInventoryWithRssi(test_tags, 1) >= 0) {
+    if (rawInventoryWithRssi(test_tags, 1) > 0) {
       info = "Raw UHF OK";
     } else {
       info = "ERROR";
