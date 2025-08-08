@@ -494,8 +494,14 @@ static bool writePcWord(uint16_t pc_word, uint32_t accessPwd) {
 static WriteError writeEpcWithPc(const uint8_t* epc, size_t epc_bytes, uint32_t accessPwd) {
   // Calculer le PC word
   uint16_t epc_words = epc_bytes / 2;
-  // Bits de protocole selon la taille EPC
-  uint16_t protocol_bits = (epc_bytes == 12) ? 0x3000 : 0x0800;  // 96-bit: 0x3000, autres: 0x0800
+  // Bits de protocole selon la taille EPC  
+  uint16_t protocol_bits;
+  if (epc_bytes == 12) {
+    // Pour 96-bit, essayer d'abord 0x3000, puis 0x3008 si échec
+    protocol_bits = 0x3000;  // Standard EPC Gen2
+  } else {
+    protocol_bits = 0x0800;  // Pour tailles étendues
+  }
   uint16_t pc_word = (epc_words << 11) | protocol_bits;
   
   Serial.printf("Writing EPC: %d bytes, PC=0x%04X\n", epc_bytes, pc_word);
@@ -510,10 +516,27 @@ static WriteError writeEpcWithPc(const uint8_t* epc, size_t epc_bytes, uint32_t 
   // 1. Écrire le PC word
   if (!writePcWord(pc_word, accessPwd)) {
     Serial.printf("Failed to write PC word 0x%04X for %u-bit EPC\n", pc_word, epc_bytes * 8);
-    if (epc_bytes > 12) {
-      Serial.println("Hint: Try max TX power (30dBm) for extended EPC writes");
+    
+    // Fallback pour 96-bit : essayer 0x3008 si 0x3000 échoue
+    if (epc_bytes == 12 && protocol_bits == 0x3000) {
+      Serial.println("Trying alternative PC word 0x3008...");
+      uint16_t alt_pc = (epc_words << 11) | 0x3008;
+      if (writePcWord(alt_pc, accessPwd)) {
+        Serial.printf("Alternative PC write success: PC=0x%04X\n", alt_pc);
+        pc_word = alt_pc;  // Utiliser le PC alternatif pour la suite
+      } else {
+        Serial.printf("Alternative PC 0x%04X also failed\n", alt_pc);
+        if (epc_bytes > 12) {
+          Serial.println("Hint: Try max TX power (30dBm) for extended EPC writes");
+        }
+        return WRITE_UNKNOWN_ERROR;
+      }
+    } else {
+      if (epc_bytes > 12) {
+        Serial.println("Hint: Try max TX power (30dBm) for extended EPC writes");
+      }
+      return WRITE_UNKNOWN_ERROR;
     }
-    return WRITE_UNKNOWN_ERROR;
   }
   
   delay(50);
