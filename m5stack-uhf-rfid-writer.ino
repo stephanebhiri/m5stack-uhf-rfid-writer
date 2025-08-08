@@ -553,10 +553,21 @@ static WriteError writeEpcWithPc(const uint8_t* epc, size_t epc_bytes, uint32_t 
   uint16_t pc_word;
   
   if (readPcWord(old_pc, accessPwd)) {
+    uint16_t old_words = (old_pc >> 11) & 0x1F;
+    
+    // PROTECTION CONSERVATRICE: Jamais changer la taille EPC
+    if (old_words != new_words) {
+      Serial.printf("[SAFE] PROTECTION: Tag is %u-words, refusing resize to %u-words to prevent bricking\n", old_words, new_words);
+      Serial.printf("[SAFE] Will write %u-word EPC in existing %u-word space\n", old_words, old_words);
+      // Forcer la taille existante
+      const_cast<uint16_t&>(new_words) = old_words;
+      epc_bytes = old_words * 2;
+    }
+    
     // Préserver les flags bas si lecture réussie
     const uint16_t lower_flags = (old_pc & 0x07FF);
     pc_word = uint16_t((new_words << 11) | lower_flags);
-    Serial.printf("[PC] Preserved flags: old=0x%04X new=0x%04X (words=%u)\n", old_pc, pc_word, new_words);
+    Serial.printf("[PC] SAFE: old=0x%04X new=0x%04X (words=%u, same size)\n", old_pc, pc_word, new_words);
   } else {
     // Fallback vers l'ancienne méthode si lecture échoue
     Serial.println("[PC] Read failed, using fallback PC calculation");
@@ -692,6 +703,64 @@ static WriteError writeEpcWithPc(const uint8_t* epc, size_t epc_bytes, uint32_t 
   }
 
   return WRITE_OK;
+}
+
+// === TAG RESTORE FUNCTION ===
+static bool restoreTag() {
+  Serial.println("\n=== TAG RESTORE MODE ===");
+  Serial.println("Attempting to restore bricked tag with common PC words...");
+  
+  // PC words courants à tester
+  uint16_t restore_pcs[] = {
+    0x3000,  // 96-bit standard
+    0x3008,  // 96-bit avec XPC
+    0x4000,  // 128-bit standard  
+    0x4400,  // 128-bit variant
+    0x4800,  // 128-bit avec protocol bits
+    0x6000,  // 192-bit
+    0x8000   // 256-bit
+  };
+  const char* pc_names[] = {
+    "96-bit std", "96-bit XPC", "128-bit std", "128-bit var", "128-bit proto", "192-bit", "256-bit"
+  };
+  
+  uint8_t test_epc[] = {0xAC, 0x71, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF}; // EPC test
+  
+  for (size_t i = 0; i < sizeof(restore_pcs)/sizeof(restore_pcs[0]); i++) {
+    uint16_t pc = restore_pcs[i];
+    uint16_t words = (pc >> 11) & 0x1F;
+    size_t bytes = words * 2;
+    
+    Serial.printf("Trying PC=0x%04X (%s, %u words)...", pc, pc_names[i], words);
+    
+    // Essayer d'écrire ce PC word
+    if (writePcWord(pc, ACCESS_PWD)) {
+      delay(50);
+      
+      // Essayer d'écrire un EPC test de la bonne taille
+      if (bytes <= sizeof(test_epc)) {
+        WriteError result = writeEpcWithPc(test_epc, bytes, ACCESS_PWD);
+        if (result == WRITE_OK) {
+          Serial.printf(" SUCCESS! Tag restored with PC=0x%04X\n", pc);
+          
+          // Vérifier en scannant
+          delay(100);
+          stopMultiInv(Serial2);
+          uint8_t n = uhf.pollingOnce();
+          if (n > 0) {
+            Serial.println("Verification: Tag responds to scan!");
+            Serial.println("EPC: " + uhf.cards[0].epc_str);
+            return true;
+          }
+        }
+      }
+    }
+    Serial.println(" failed");
+    delay(100);
+  }
+  
+  Serial.println("RESTORE FAILED: Unable to restore tag with any common PC word");
+  return false;
 }
 
 // === Hex utilities ===
@@ -1024,7 +1093,7 @@ void setup() {
   // Mode "need select" (optionnel - commenter si problème)
   // setSelectMode(0x01);  // 0x00=pas de select requis, 0x01=select requis
   
-  displayStatus("UHF Ready", "A: Scan", "A long: Continuous", "B: Write 96b", "C: Write Auto");
+  displayStatus("UHF Ready", "A: Scan", "A long: Continuous", "B: Write 96b", "C: Write Auto", "C long: Restore");
 }
 
 // === Main loop ===
@@ -1220,6 +1289,28 @@ void loop() {
     }
   }
   
+  // Bouton C long : Restore tag
+  if (M5.BtnC.pressedFor(2000)) {
+    displayStatus("TAG RESTORE", "Attempting recovery...");
+    M5.Speaker.tone(1500, 300, 0, false);
+    
+    bool restored = restoreTag();
+    
+    if (restored) {
+      displayStatus("RESTORE SUCCESS", "Tag recovered!");
+      M5.Speaker.tone(2000, 200, 0, false);
+      delay(200);
+      M5.Speaker.tone(2000, 200, 0, false);
+    } else {
+      displayStatus("RESTORE FAILED", "Tag unrecoverable");
+      M5.Speaker.tone(500, 500, 0, false);
+    }
+    
+    delay(3000);
+    displayStatus("UHF Ready", "A: Scan", "A long: Continuous", "B: Write 96b", "C: Write Auto", "C long: Restore");
+    return;
+  }
+
   // Bouton C : Write auto-length
   if (M5.BtnC.wasPressed()) {
     // En mode continu : Sortir du mode continu
@@ -1229,7 +1320,7 @@ void loop() {
       displayStatus("Continuous stopped", "Ready for normal mode");
       M5.Speaker.tone(800, 200, 0, false);
       delay(1500);
-      displayStatus("UHF Ready", "A: Scan", "A long: Continuous", "B: Write 96b", "C: Write Auto");
+      displayStatus("UHF Ready", "A: Scan", "A long: Continuous", "B: Write 96b", "C: Write Auto", "C long: Restore");
       return;
     }
     if (current_tag.epc_len == 0) {
