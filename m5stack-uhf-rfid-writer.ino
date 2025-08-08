@@ -460,23 +460,43 @@ static bool writePcWord(uint16_t pc_word, uint32_t accessPwd) {
   size_t rlen = sizeof(resp);
   
   if (!sendCmdRaw(frame, i, resp, rlen)) {
+    Serial.println("PC Write: No response from module");
     return false;
   }
   
-  return (resp[2] == 0x49);
+  if (resp[2] != 0x49) {
+    Serial.printf("PC Write failed: CMD=0x%02X, Status=0x%02X", resp[2], rlen >= 6 ? resp[5] : 0xFF);
+    if (rlen >= 6) {
+      uint16_t pl = (resp[3] << 8) | resp[4];
+      Serial.printf(", PL=%u", pl);
+      if (pl > 0 && rlen >= 6 + pl) {
+        Serial.printf(", Data:");
+        for (uint16_t j = 0; j < pl; j++) {
+          Serial.printf(" %02X", resp[5 + j]);
+        }
+      }
+    }
+    Serial.println();
+    return false;
+  }
+  
+  Serial.printf("PC Write success: PC=0x%04X written\n", pc_word);
+  return true;
 }
 
 // === WRITE EPC avec gestion PC ===
 static WriteError writeEpcWithPc(const uint8_t* epc, size_t epc_bytes, uint32_t accessPwd) {
   // Calculer le PC word
   uint16_t epc_words = epc_bytes / 2;
-  uint16_t pc_word = (epc_words << 11) | 0x0800;  // Length bits [15:11] + protocol control bits
+  // Bits de protocole selon la taille EPC
+  uint16_t protocol_bits = (epc_bytes == 12) ? 0x3000 : 0x0800;  // 96-bit: 0x3000, autres: 0x0800
+  uint16_t pc_word = (epc_words << 11) | protocol_bits;
   
   Serial.printf("Writing EPC: %d bytes, PC=0x%04X\n", epc_bytes, pc_word);
   
   // 1. Écrire le PC word
   if (!writePcWord(pc_word, accessPwd)) {
-    Serial.println("Failed to write PC word");
+    Serial.printf("Failed to write PC word 0x%04X for %u-bit EPC\n", pc_word, epc_bytes * 8);
     return WRITE_UNKNOWN_ERROR;
   }
   
