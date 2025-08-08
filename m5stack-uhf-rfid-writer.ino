@@ -769,7 +769,41 @@ static bool restoreTag() {
     delay(100);
   }
   
-  Serial.println("RESTORE FAILED: Unable to restore tag with any common PC word");
+  // Dernière tentative : Hard reset avec des commandes de bas niveau
+  Serial.println("\nLast resort: Trying hard reset methods...");
+  
+  // Tentative 1: Reset via command 0x26 (Reset)
+  Serial.print("Trying RESET command...");
+  uint8_t reset_cmd[] = {0xBB, 0x00, 0x26, 0x00, 0x00, 0x26, 0x7E};
+  uint8_t resp[32]; size_t rlen = sizeof(resp);
+  if (sendCmdRaw(reset_cmd, sizeof(reset_cmd), resp, rlen)) {
+    Serial.println(" sent, waiting...");
+    delay(1000);
+    // Tester scan après reset
+    stopMultiInv(Serial2);
+    delay(100);
+    uint8_t n = uhf.pollingOnce();
+    if (n > 0) {
+      Serial.println("SUCCESS! Tag responds after RESET!");
+      return true;
+    }
+  } else {
+    Serial.println(" failed");
+  }
+  
+  // Tentative 2: Scan sans inventory pour détecter tag en mode error
+  Serial.print("Trying error mode detection...");
+  for (int i = 0; i < 5; i++) {
+    uint8_t n = uhf.pollingOnce();
+    if (n > 0) {
+      Serial.println(" FOUND! Tag detected in error mode");
+      return true;
+    }
+    delay(200);
+  }
+  Serial.println(" no response");
+  
+  Serial.println("HARD RESTORE FAILED: Tag appears permanently damaged");
   return false;
 }
 
