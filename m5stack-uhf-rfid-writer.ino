@@ -475,8 +475,8 @@ static bool writePcWord(uint16_t pc_word, uint32_t accessPwd) {
         for (uint16_t j = 0; j < pl; j++) {
           Serial.printf(" %02X", resp[5 + j]);
         }
-        // Si c'est l'EPC complet, montrer le PC actuel
-        if (pl >= 2) {
+        // Pour les erreurs, ne pas essayer d'interpréter comme PC
+        if (pl >= 2 && resp[2] == 0x49) {  // Seulement si succès
           uint16_t current_pc = (resp[5] << 8) | resp[6];
           Serial.printf(" (Current PC: 0x%04X)", current_pc);
         }
@@ -500,9 +500,19 @@ static WriteError writeEpcWithPc(const uint8_t* epc, size_t epc_bytes, uint32_t 
   
   Serial.printf("Writing EPC: %d bytes, PC=0x%04X\n", epc_bytes, pc_word);
   
+  // Vérification puissance pour EPC > 96-bit
+  if (epc_bytes > 12 && current_power_index < 2) {
+    Serial.printf("WARNING: %u-bit EPC write needs max power (30dBm). Current: %s\n", 
+                  epc_bytes * 8, getCurrentPowerName());
+    Serial.println("Try cycling power with Button C in continuous mode first.");
+  }
+  
   // 1. Écrire le PC word
   if (!writePcWord(pc_word, accessPwd)) {
     Serial.printf("Failed to write PC word 0x%04X for %u-bit EPC\n", pc_word, epc_bytes * 8);
+    if (epc_bytes > 12) {
+      Serial.println("Hint: Try max TX power (30dBm) for extended EPC writes");
+    }
     return WRITE_UNKNOWN_ERROR;
   }
   
