@@ -185,6 +185,7 @@ static bool sendCmdRaw(const uint8_t* frame, size_t len, uint8_t* resp, size_t& 
 static WriteError parseWriteError(uint8_t error_code) {
   switch(error_code) {
     case 0x09: return WRITE_NO_TAG;
+    case 0x10: return WRITE_UNKNOWN_ERROR;  // Invalid parameter/PC word
     case 0x16: return WRITE_ACCESS_DENIED;
     case 0xA3: return WRITE_MEMORY_OVERRUN;
     case 0xA4: return WRITE_MEMORY_LOCKED;
@@ -473,6 +474,11 @@ static bool writePcWord(uint16_t pc_word, uint32_t accessPwd) {
         Serial.printf(", Data:");
         for (uint16_t j = 0; j < pl; j++) {
           Serial.printf(" %02X", resp[5 + j]);
+        }
+        // Si c'est l'EPC complet, montrer le PC actuel
+        if (pl >= 2) {
+          uint16_t current_pc = (resp[5] << 8) | resp[6];
+          Serial.printf(" (Current PC: 0x%04X)", current_pc);
         }
       }
     }
