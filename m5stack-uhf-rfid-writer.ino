@@ -1093,7 +1093,7 @@ void setup() {
   // Mode "need select" (optionnel - commenter si problème)
   // setSelectMode(0x01);  // 0x00=pas de select requis, 0x01=select requis
   
-  displayStatus("UHF Ready", "A: Scan", "A long: Continuous", "B: Write 96b", "C: Write Auto", "C long: Restore");
+  displayStatus("UHF Ready", "A: Scan | A long: Continuous", "B: Write 96b", "C: Write Auto", "C long: Restore");
 }
 
 // === Main loop ===
@@ -1307,7 +1307,7 @@ void loop() {
     }
     
     delay(3000);
-    displayStatus("UHF Ready", "A: Scan", "A long: Continuous", "B: Write 96b", "C: Write Auto", "C long: Restore");
+    displayStatus("UHF Ready", "A: Scan | A long: Continuous", "B: Write 96b", "C: Write Auto", "C long: Restore");
     return;
   }
 
@@ -1320,7 +1320,7 @@ void loop() {
       displayStatus("Continuous stopped", "Ready for normal mode");
       M5.Speaker.tone(800, 200, 0, false);
       delay(1500);
-      displayStatus("UHF Ready", "A: Scan", "A long: Continuous", "B: Write 96b", "C: Write Auto", "C long: Restore");
+      displayStatus("UHF Ready", "A: Scan | A long: Continuous", "B: Write 96b", "C: Write Auto", "C long: Restore");
       return;
     }
     if (current_tag.epc_len == 0) {
