@@ -6,9 +6,6 @@
 // #include "UNIT_UHF_RFID.h"  // Plus besoin - 100% raw!
 #include "universal_inventory.h"
 
-// Forward declarations
-static const char* getCurrentPowerText();
-
 // === Codes d'erreur ===
 enum WriteError {
   WRITE_OK = 0,
@@ -17,8 +14,17 @@ enum WriteError {
   WRITE_MEMORY_OVERRUN = 0xA3,
   WRITE_MEMORY_LOCKED = 0xA4,
   WRITE_INSUFFICIENT_POWER = 0xB3,
+  WRITE_SELECT_FAILED = 0xFE,
   WRITE_UNKNOWN_ERROR = 0xFF
 };
+
+// Forward declarations
+static const char* getCurrentPowerText();
+static bool selectByEpcRaw(const uint8_t* epc, size_t epc_len);
+static void updateMultiTagDisplay();
+static bool selectByTid(const uint8_t tid[8]);          // + add proto (déjà implémentée plus bas)
+static bool readEpcFullFromPcRaw(uint8_t* epc, size_t& epc_len, uint16_t& out_pc); // + new proto
+static WriteError writeEpcVariableSafeWithVerifyRaw(const uint8_t* epc, size_t epc_bytes, uint32_t accessPwd); // + new proto
 
 // === Configuration ===
 static constexpr int RX_PIN = 33;
@@ -42,6 +48,24 @@ uint32_t button_press_start = 0;
 bool button_was_long_pressed = false;
 String last_detected_epc = "";
 uint32_t last_beep_time = 0;
+
+// === Mode EPC cyclique (bouton B) ===
+enum EpcWriteMode {
+  EPC_96BIT = 0,
+  EPC_128BIT = 1,
+  EPC_MODE_COUNT = 2
+};
+static EpcWriteMode current_epc_mode = EPC_96BIT;
+
+// Fonction pour obtenir le texte du mode EPC actuel
+static const char* getEpcModeText() {
+  switch (current_epc_mode) {
+    case EPC_96BIT:  return "B: Write 96b";
+    case EPC_128BIT: return "B: Write 128b";
+    default:         return "B: Write var";
+  }
+}
+
 
 // === Structure pour multi-tags en continu ===
 struct ContinuousTag {
@@ -535,6 +559,7 @@ static const char* errorToString(WriteError err) {
     case WRITE_MEMORY_OVERRUN: return "Memory overrun";
     case WRITE_MEMORY_LOCKED: return "Memory locked";
     case WRITE_INSUFFICIENT_POWER: return "Low power";
+    case WRITE_SELECT_FAILED: return "Select failed";
     default: return "Unknown error";
   }
 }
@@ -652,53 +677,60 @@ static bool selectByTid(const uint8_t tid[8]) {
 
 // === Select par EPC format raw (alternative) ===
 static bool selectByEpcRaw(const uint8_t* epc, size_t epc_len) {
+  if (!epc || epc_len == 0) return false;
+  // Clip dur à 31 bytes (248 bits) pour cohérence longueur bits/payload
+  size_t epc_len_clip = epc_len > 31 ? 31 : epc_len;
+
   uint8_t frame[96];
   size_t i = 0;
-  
+
   frame[i++] = 0xBB;
   frame[i++] = 0x00;
   frame[i++] = 0x0C;  // CMD = Select
-  
-  uint16_t pl = 11 + epc_len;  // 11 bytes params + EPC data
+
+  // PL = 11 bytes params + EPC data (clippé)
+  const uint16_t pl = 11 + epc_len_clip;
   frame[i++] = (pl >> 8);
   frame[i++] = (pl & 0xFF);
-  
+
   frame[i++] = 0x01;  // Target = Session S0
   frame[i++] = 0x00;  // Action = 0x00
-  frame[i++] = 0x01;  // MemBank = 0x01 (EPC)
-  
-  // Pointer = 0x20 bits (32 bits = 4 bytes offset = début de l'EPC après CRC+PC)
+  frame[i++] = 0x01;  // MemBank = EPC
+
+  // Pointer = 0x20 bits (début EPC après CRC+PC)
   frame[i++] = 0x00;
   frame[i++] = 0x00;
   frame[i++] = 0x00;
-  frame[i++] = 0x20;  // 32 bits offset
-  
-  frame[i++] = (epc_len * 8);  // Length en bits
+  frame[i++] = 0x20;
+
+  // Length en bits (1 octet), déjà clippé à 248 (=31 bytes)
+  uint8_t bit_len = (uint8_t)(epc_len_clip * 8);
+  frame[i++] = bit_len;
+
   frame[i++] = 0x00;  // Truncate = No
-  
+
   // EPC data
-  memcpy(&frame[i], epc, epc_len);
-  i += epc_len;
-  
+  memcpy(&frame[i], epc, epc_len_clip);
+  i += epc_len_clip;
+
+  // CS + trailer
   uint8_t cs = cs8(&frame[1], i - 1);
   frame[i++] = cs;
   frame[i++] = 0x7E;
-  
+
   uint8_t resp[128];
   size_t rlen = sizeof(resp);
-  
-  bool result = sendCmdRaw(frame, i, resp, rlen, 200);
-  
-  // Debug
-  if (result) {
+  bool ok = sendCmdRaw(frame, i, resp, rlen, 200);
+
+#ifdef DEBUG_UHF_FRAMES
+  if (ok) {
     Serial.print("Select EPC resp: ");
-    for (size_t k = 0; k < min(rlen, (size_t)20); k++) {
-      Serial.printf("%02X ", resp[k]);
-    }
+    for (size_t k = 0; k < min(rlen, (size_t)20); k++) Serial.printf("%02X ", resp[k]);
     Serial.println();
   }
-  
-  return result && resp[2] == 0x0C;
+#endif
+
+  return ok && rlen >= 6 && resp[2] == 0x0C;  // ACK du module
 }
 
 
@@ -1067,6 +1099,130 @@ static WriteError writeEpcWithPc(const uint8_t* epc, size_t epc_bytes, uint32_t 
   return WRITE_OK;
 }
 
+// === SAFE variable-length EPC write with auto-clip / retry ===
+static WriteError writeEpcVariableSafe(const uint8_t* epc, size_t epc_bytes, uint32_t accessPwd,
+                                       uint8_t max_retries = 3)
+{
+  Serial.println("\n========== WRITE EPC VARIABLE SAFE ==========");
+  
+  if (!epc || epc_bytes == 0) return WRITE_UNKNOWN_ERROR;
+
+  const size_t epc_bytes_in = epc_bytes;     // <--- sauvegarde longueur originale
+  // EPC bank = mots 16 bits → longueur paire (en octets)
+  if (epc_bytes & 0x01) epc_bytes++;               // alignement sur mot
+  if (epc_bytes > 62)   epc_bytes = 62;            // protocole (31 words max)
+
+  Serial.printf("Input: %u bytes, adjusted to %u bytes\n", (unsigned)epc_bytes_in, (unsigned)epc_bytes);
+
+  // On part sur la longueur demandée, on réduira si 0xA3
+  uint8_t  words_target = epc_bytes / 2;
+  if (words_target < 6) words_target = 6;          // la plupart des tags = mini 96 bits
+  if (words_target > 31) words_target = 31;
+
+  // Lecture du PC existant (optionnel mais propre)
+  uint16_t current_pc = 0x3000;
+  {
+    uint8_t read_cmd[] = {
+      0xBB,0x00,0x39, 0x00,0x09,
+      0x00,0x00,0x00,0x00, // AccessPwd
+      0x01,                // Bank EPC
+      0x00,0x01,           // WordPtr = 1 (PC)
+      0x00,0x01,           // WordCount = 1
+      0x00, 0x7E
+    };
+    read_cmd[14] = cs8(&read_cmd[1], 13);
+    uint8_t resp[32]; size_t rlen = sizeof(resp);
+    if (sendCmdRaw(read_cmd, sizeof(read_cmd), resp, rlen, 500) && resp[2]==0x39 && rlen>=7) {
+      current_pc = (uint16_t(resp[5])<<8) | resp[6];
+      Serial.printf("Current PC: 0x%04X\n", current_pc);
+    } else {
+      Serial.println("Using default PC: 0x3000");
+    }
+  }
+
+  uint8_t tries = 0;
+  while (tries++ <= max_retries) {
+    Serial.printf("\n--- Attempt %u: trying %u words (%u bits) ---\n", tries, words_target, words_target * 16);
+
+    // 1) Ecrire PC word avec la nouvelle longueur (bits [15:11])
+    uint16_t new_pc = (current_pc & 0x07FF) | (uint16_t(words_target) << 11);
+    Serial.printf("Writing PC: 0x%04X\n", new_pc);
+    
+    if (!writePcWord(new_pc, accessPwd)) {
+      Serial.println("⚠️ PC write failed, continuing anyway");
+      // si PC word refuse, on tente quand même l'écriture EPC (certains firmwares le mettent à jour eux-mêmes)
+    }
+
+    // 2) Construire et envoyer WRITE EPC (Bank=EPC, WordPtr=2)
+    const uint8_t word_count = words_target;
+    const uint16_t pl = 9 + word_count * 2;
+    uint8_t buf[128]; size_t i = 0;
+
+    buf[i++] = 0xBB; buf[i++] = 0x00; buf[i++] = 0x49;
+    buf[i++] = (pl >> 8); buf[i++] = (pl & 0xFF);
+    buf[i++] = (accessPwd >> 24);
+    buf[i++] = (accessPwd >> 16);
+    buf[i++] = (accessPwd >> 8);
+    buf[i++] =  accessPwd;
+    buf[i++] = 0x01;           // EPC bank
+    buf[i++] = 0x00; buf[i++] = 0x02;    // WordPtr = 2 (début EPC)
+    buf[i++] = 0x00; buf[i++] = word_count;
+
+    // Copier EPC demandé, tronqué à la longueur courante
+    size_t bytes_now = size_t(word_count) * 2;
+    memcpy(&buf[i], epc, min(bytes_now, epc_bytes));
+    // Padding zéros si nécessaire
+    if (bytes_now > epc_bytes) {
+      memset(&buf[i + epc_bytes], 0, bytes_now - epc_bytes);
+    }
+    i += bytes_now;
+
+    buf[i++] = cs8(&buf[1], i - 1);
+    buf[i++] = 0x7E;
+
+    Serial.printf("Writing %u bytes EPC data\n", bytes_now);
+
+    uint8_t resp[64]; size_t rlen = sizeof(resp);
+    if (!sendCmdRaw(buf, i, resp, rlen, 1000)) {
+      Serial.println("❌ No response from module");
+      return WRITE_UNKNOWN_ERROR;
+    }
+
+    // 3) Analyse
+    if (resp[2] == 0x49) {
+      // succès
+      Serial.printf("✅ SUCCESS: EPC written at %u words (%u bits)\n", words_target, words_target * 16);
+      Serial.println("==================================================");
+      return WRITE_OK;
+    }
+    if (resp[2] == 0xFF && rlen > 5) {
+      uint8_t ec = resp[5];
+      Serial.printf("❌ Error code: 0x%02X\n", ec);
+      
+      if (ec == 0xA3 /* Memory Overrun */) {
+        Serial.printf("Memory overrun - reducing from %u to %u words\n", words_target, words_target - 1);
+        // → réduire d'1 mot et retenter
+        if (words_target > 6) {
+          words_target--;
+          continue; // retry
+        }
+      }
+      // autre erreur → sortir proprement avec le code
+      WriteError err = parseWriteError(ec);
+      Serial.printf("Final error: %s\n", errorToString(err));
+      Serial.println("==================================================");
+      return err;
+    }
+
+    // Réponse inattendue
+    Serial.println("❌ Unexpected response");
+    break;
+  }
+
+  Serial.printf("❌ Failed after %u attempts\n", max_retries);
+  Serial.println("==================================================");
+  return WRITE_UNKNOWN_ERROR;
+}
 
 // === Hex utilities ===
 static bool hexToBytes(const String& hex, uint8_t* out, size_t max_bytes) {
@@ -1279,23 +1435,30 @@ static void processContinuousScan() {
       String epc_str = raw_tags[i].epc;
       int rssi_value = raw_tags[i].rssi_dbm;  // RSSI réel depuis trame brute !
       
-      // Récupérer TID si possible pour chaque tag
-      String tid_str = "N/A";
-      uint8_t epc_bytes[62];
-      size_t epc_len = epc_str.length() / 2;
-      if (hexToBytes(epc_str, epc_bytes, 62)) {
-        if (rawSelect(epc_bytes, epc_len)) {
+      // Ajouter/mettre à jour ce tag avec RSSI RÉEL
+      bool is_new = addOrUpdateContinuousTag(epc_str, "N/A", rssi_value);
+      
+      // 🔍 Lecture TID uniquement si tag nouveau (optimisation performance)
+      if (is_new) {
+        new_tags_found = true;
+        Serial.printf("NEW TAG: %s RSSI: %d dBm\n", epc_str.c_str(), rssi_value);
+        
+        // Brief stop pour éviter conflicts RF avant select  
+        stopMultiInv(Serial2);
+        delay(10);
+        
+        uint8_t epc_bytes[62];
+        size_t epc_len = epc_str.length() / 2;
+        if (hexToBytes(epc_str, epc_bytes, sizeof(epc_bytes)) &&
+            selectByEpcRaw(epc_bytes, epc_len))
+        {
           uint8_t tid_buf[8];
           if (readTid(tid_buf)) {
-            tid_str = bytesToHex(tid_buf, 8).substring(0, 8); // Premier 8 chars du TID
+            String tid_str = bytesToHex(tid_buf, 8).substring(0, 8);
+            continuous_tags[continuous_tags_count-1].tid = tid_str;
+            Serial.printf("TID found: %s\n", tid_str.c_str());
           }
         }
-      }
-      
-      // Ajouter/mettre à jour ce tag avec RSSI RÉEL
-      if (addOrUpdateContinuousTag(epc_str, tid_str, rssi_value)) {
-        new_tags_found = true;
-        Serial.printf("NEW TAG: %s RSSI: %d dBm TID: %s\n", epc_str.c_str(), rssi_value, tid_str.c_str());
       }
     }
     
@@ -1334,7 +1497,8 @@ static void updateMultiTagDisplay() {
       }
       
       // Utiliser DisplayManager pour l'affichage unifié
-      String tid_short = continuous_tags[i].tid.substring(0, min(8U, continuous_tags[i].tid.length()));
+      uint16_t tl = (uint16_t)continuous_tags[i].tid.length();
+      String tid_short = continuous_tags[i].tid.substring(0, (tl < 8 ? tl : 8));
       DisplayManager::showTagEntry(i, display_epc, continuous_tags[i].rssi, tid_short, continuous_tags[i].is_new);
       
       // Marquer comme plus nouveau après affichage
@@ -1349,6 +1513,164 @@ static void updateMultiTagDisplay() {
   }
 }
 
+// === Fonctions pour gestion mode EPC cyclique ===
+
+// Fonction pour cycler entre les modes EPC
+static void cycleEpcMode() {
+  current_epc_mode = static_cast<EpcWriteMode>((current_epc_mode + 1) % EPC_MODE_COUNT);
+  Serial.printf("🔄 Mode switched to: %s\n", getEpcModeText());
+  
+  // Mettre à jour l'affichage
+  displayStatus("Mode Changed", getEpcModeText(), "Ready to write");
+  delay(1500); // Afficher le changement pendant 1.5s
+  displayStatus("UHF Ready", "A: Scan | A long: Continuous", getEpcModeText());
+}
+
+// Fonction pour effectuer l'écriture selon le mode actuel
+static void performEpcWrite() {
+  if (current_tag.epc_len == 0) {
+    displayStatus("Error", "Scan first!");
+    return;
+  }
+  
+  // Stopper multi-inventory
+  stopMultiInv(Serial2);
+  delay(50);
+  
+  // Sélectionner le tag
+  bool selected = false;
+  selected = rawSelect(current_tag.epc, current_tag.epc_len);
+  if (!selected) {
+    selected = selectByEpcRaw(current_tag.epc, current_tag.epc_len);
+  }
+  if (!selected && current_tag.has_tid) {
+    selected = selectByTid(current_tag.tid);
+  }
+  
+  if (!selected) {
+    displayStatus("Write fail", "Select error", "Check tag");
+    Serial.println("All select methods failed!");
+    return;
+  }
+  
+  // Générer EPC selon le mode
+  uint8_t new_epc[32]; // Buffer suffisant pour 128-bit (16 bytes)
+  size_t target_len;
+  
+  switch (current_epc_mode) {
+    case EPC_96BIT:
+      target_len = 12; // 96 bits = 12 bytes
+      Serial.println("=== WRITE 96-BIT RANDOM EPC ===");
+      break;
+    case EPC_128BIT:
+      target_len = 16; // 128 bits = 16 bytes
+      Serial.println("=== WRITE 128-BIT RANDOM EPC ===");
+      break;
+    default:
+      target_len = current_tag.epc_len; // Variable selon tag scanné
+      Serial.printf("=== WRITE VARIABLE EPC: %u bytes ===\n", target_len);
+      break;
+  }
+  
+  generateRandomEpc(new_epc, target_len);
+  String newEpcHex = bytesToHex(new_epc, target_len);
+  
+  Serial.println("Target new EPC: " + newEpcHex);
+  
+  // Écriture + reselect + read-back (même pipeline que touche 'C')
+  WriteError err = writeEpcVariableSafeWithVerifyRaw(new_epc, target_len, ACCESS_PWD);
+  Serial.println("Write result: " + String(errorToString(err)));
+  
+  if (err == WRITE_OK) {
+    // L'état visuel reposera sur le read-back fait par writeEpcVariableSafeWithVerifyRaw()
+    String shown = bytesToHex(current_tag.epc, current_tag.epc_len);
+    DisplayManager::showWriteResult(true, "Verification: READ-BACK OK", "", shown);
+  } else {
+    DisplayManager::showWriteResult(false, errorToString(err), "Check tag position and power");
+  }
+}
+
+// === NEW: Read-back EPC complet via PC word, en s'appuyant 100% sur rawRead() ===
+static bool readEpcFullFromPcRaw(uint8_t* epc_buf, size_t& epc_len, uint16_t& out_pc) {
+  epc_len = 0;
+  out_pc  = 0;
+  if (!epc_buf) return false;
+
+  // 1) Lire le PC word (Bank EPC, WordPtr=1, 1 word)
+  uint8_t pc_bytes[2] = {0};
+  int n = rawRead(/*bank*/0x01, /*word_ptr*/1, pc_bytes, sizeof(pc_bytes), /*word_count*/1, ACCESS_PWD);
+  if (n < 2) {
+    Serial.println("❌ readEpcFullFromPcRaw: failed to read PC word");
+    return false;
+  }
+  out_pc = (uint16_t(pc_bytes[0]) << 8) | pc_bytes[1];
+  uint8_t num_words = (out_pc >> 11) & 0x1F;   // longueur EPC en mots de 16 bits
+  if (num_words == 0 || num_words > 31) {
+    Serial.printf("❌ Invalid EPC length encoded in PC: %u words\n", num_words);
+    return false;
+  }
+
+  // 2) Lire l'EPC (Bank EPC, WordPtr=2)
+  size_t need_bytes   = size_t(num_words) * 2;
+  if (need_bytes > 62) need_bytes = 62;        // garde-fou protocole
+  n = rawRead(/*bank*/0x01, /*word_ptr*/2, epc_buf, need_bytes, /*word_count*/num_words, ACCESS_PWD);
+  if (n <= 0) {
+    Serial.println("❌ readEpcFullFromPcRaw: failed to read EPC bytes");
+    return false;
+  }
+  epc_len = size_t(n);
+  return true;
+}
+
+// === NEW: Wrapper "write + reselect + read-back" basé rawRead() + fallback TID ===
+static WriteError writeEpcVariableSafeWithVerifyRaw(const uint8_t* epc, size_t epc_bytes, uint32_t accessPwd) {
+  // 1) Write variable sécurisé (PC + EPC, auto-clip/auto-retry)
+  WriteError err = writeEpcVariableSafe(epc, epc_bytes, accessPwd);
+  if (err != WRITE_OK) return err;
+
+  // 2) Reselect post-write (full → 96b → TID)
+  stopMultiInv(Serial2);              // <-- calmer la couche RF
+  delay(20);
+  size_t try_len = epc_bytes;
+  if (try_len & 1) try_len++;           // alignement sécurité (mots)
+  if (try_len > 62) try_len = 62;
+
+  bool selected = false;
+  Serial.println("🔁 Post-write reselect (full EPC)...");
+  selected = selectByEpcRaw(epc, try_len);
+  if (!selected && try_len > 12) {
+    Serial.println("⚠️ Full-length SELECT failed → trying 96-bit prefix");
+    selected = selectByEpcRaw(epc, 12);
+  }
+  if (!selected && current_tag.has_tid) {
+    Serial.println("⚠️ Prefix SELECT failed → trying TID");
+    selected = selectByTid(current_tag.tid);
+  }
+  if (!selected) {
+    Serial.println("❌ Post-write reselect FAILED (EPC/TID)");
+    // On peut continuer au read-back; certains firmwares renvoient quand même le bon contenu.
+  } else {
+    Serial.println("✅ Post-write reselect OK");
+  }
+
+  // 3) Read-back EPC complet via PC word (source de vérité)
+  stopMultiInv(Serial2);              // <-- éviter collision avec inventaire
+  delay(20);
+  uint8_t epc_read[62]; size_t epc_read_len = 0; uint16_t pc_after = 0;
+  if (readEpcFullFromPcRaw(epc_read, epc_read_len, pc_after)) {
+    Serial.printf("🔍 PC after write: 0x%04X (len=%u words)\n", pc_after, (pc_after >> 11) & 0x1F);
+    Serial.print("🔍 EPC read-back: ");
+    for (size_t i = 0; i < epc_read_len; ++i) Serial.printf("%02X", epc_read[i]);
+    Serial.println();
+
+    // Mettre à jour current_tag avec ce qu'il y a VRAIMENT sur le tag
+    current_tag.epc_len = epc_read_len;
+    memcpy(current_tag.epc, epc_read, epc_read_len);
+  } else {
+    Serial.println("⚠️ EPC read-back failed (module busy or tag moved?)");
+  }
+  return WRITE_OK;
+}
 
 // === Setup ===
 void setup() {
@@ -1395,12 +1717,63 @@ void setup() {
   // Mode "need select" (optionnel - commenter si problème)
   // setSelectMode(0x01);  // 0x00=pas de select requis, 0x01=select requis
   
-  displayStatus("UHF Ready", "A: Scan | A long: Continuous", "B: Write 96b");
+  displayStatus("UHF Ready", "A: Scan | A long: Continuous", getEpcModeText());
 }
 
 // === Main loop ===
 void loop() {
   M5.update();
+  
+  // === TEST: Write EPC 128-bit fixe avec touche 'C' ===
+  if (Serial.available()) {
+    char cmd = Serial.read();
+    
+    if (cmd == 'C') {
+      uint8_t epc128[16] = {
+        0x30, 0x08, 0x33, 0xB2,
+        0xDD, 0xD9, 0x01, 0x40,
+        0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x01
+      };
+      Serial.println(F("🔹 TEST WRITE EPC 128 bits..."));
+      
+      // Sécurisation : arrêter multi-inventory et sélectionner un tag
+      stopMultiInv(Serial2);
+      delay(20);
+      
+      bool tag_selected = false;
+      if (current_tag.epc_len > 0) {
+        // Utiliser le tag scanné précédemment
+        Serial.println(F("📍 Using previously scanned tag for selection"));
+        tag_selected = rawSelect(current_tag.epc, current_tag.epc_len)
+                       || selectByEpcRaw(current_tag.epc, current_tag.epc_len); // fallback EPC raw
+      } else {
+        // Fallback: poll 1 tag et select
+        Serial.println(F("📍 No previous tag - scanning for selection"));
+        RawTagData one[1];
+        if (rawInventoryWithRssi(one, 1) > 0) {
+          uint8_t b[62]; 
+          size_t L = one[0].epc.length() / 2;
+          if (hexToBytes(one[0].epc, b, sizeof(b))) {
+            tag_selected = rawSelect(b, L) || selectByEpcRaw(b, L); // fallback EPC raw
+          }
+        }
+      }
+      
+      if (tag_selected) {
+        Serial.println(F("✅ Tag selected - proceeding with write"));
+        // → Ecriture + reselect (full→96→TID) + read-back EPC via rawRead()
+        WriteError result = writeEpcVariableSafeWithVerifyRaw(epc128, sizeof(epc128), ACCESS_PWD);
+        if (result == WRITE_OK) {
+          Serial.println(F("✅ Write 128-bit + verify OK !"));
+        } else {
+          Serial.println(F("❌ Write 128-bit FAIL !"));
+        }
+      } else {
+        Serial.println(F("❌ No tag selected - write aborted"));
+      }
+    }
+  }
   
   // === Gestion du mode scan continu (appui long sur A) ===
   
@@ -1473,127 +1846,30 @@ void loop() {
       String tid_str = current_tag.has_tid ? bytesToHex(current_tag.tid, 8) : "N/A";
       
       displayStatus(
-      "Tag found",
-      "EPC: " + String(current_tag.epc_len * 8) + "b RSSI: " + String(raw_tags[0].rssi_dbm) + "dBm",
-      "Data: " + String(epc_str.length() > 36 ? epc_str.substring(0, 36) + ".." : epc_str),
-      "TID: " + tid_str.substring(0, 16)
+        "Tag found",
+        "EPC: " + String(current_tag.epc_len * 8) + "b RSSI: " + String(raw_tags[0].rssi_dbm) + "dBm",
+        "Data: " + String(epc_str.length() > 36 ? epc_str.substring(0, 36) + ".." : epc_str),
+        "TID: " + tid_str.substring(0, 16),
+        getEpcModeText()
       );
     } else {
       displayStatus("Scan OK", "Select failed");
     }
   }
   
-  // Bouton B : Write 96 bits fixe
-  if (M5.BtnB.wasPressed()) {
-    // En mode continu : Cycle TX Power au lieu d'arrêter
-    if (continuous_scan_active) {
+  // Bouton B : long press = change mode, short press = write
+  // En mode continu, B garde le cycle TX power comme avant.
+  if (continuous_scan_active) {
+    if (M5.BtnB.wasPressed()) {
       cycleTxPower();
-      return;  // Ne pas continuer vers l'écriture
     }
-    if (current_tag.epc_len == 0) {
-      displayStatus("Error", "Scan first!");
-      return;
-    }
-    
-    Serial.println("\n=== WRITE 96 BITS ===");
-    Serial.print("Current EPC: ");
-    for (size_t i = 0; i < current_tag.epc_len; i++) {
-      Serial.printf("%02X ", current_tag.epc[i]);
-    }
-    Serial.println();
-    
-    stopMultiInv(Serial2);
-    delay(50);  // Petit délai après stop
-    
-    // Essayer plusieurs méthodes de select
-    bool selected = false;
-    
-    // Méthode 1: Select EPC avec la lib (le plus fiable)
-    selected = rawSelect(current_tag.epc, current_tag.epc_len);
-    Serial.println("Select by lib: " + String(selected));
-    
-    if (!selected) {
-      // Méthode 2: Select EPC raw
-      selected = selectByEpcRaw(current_tag.epc, current_tag.epc_len);
-      Serial.println("Select by EPC raw: " + String(selected));
-    }
-    
-    if (!selected && current_tag.has_tid) {
-      // Méthode 3: Select par TID
-      selected = selectByTid(current_tag.tid);
-      Serial.println("Select by TID: " + String(selected));
-    }
-    
-    if (!selected) {
-      // Dernière tentative : stop + scan universel + select immédiat
-      stopMultiInv(Serial2);
-      delay(100);
-      RawTagData rescan_tags[1];
-      uint8_t n = rawInventoryWithRssi(rescan_tags, 1);
-      if (n > 0) {
-        Serial.println("Re-scan found EPC: " + rescan_tags[0].epc);
-        uint8_t epc_bytes[62];
-        if (hexToBytes(rescan_tags[0].epc, epc_bytes, 62)) {
-          size_t epc_len = rescan_tags[0].epc.length() / 2;
-          selected = rawSelect(epc_bytes, epc_len);
-          Serial.println("Select after poll: " + String(selected));
-        }
-      }
-    }
-    
-    if (!selected) {
-      displayStatus("Write fail", "Select error", "Check tag");
-      Serial.println("All select methods failed!");
-      return;
-    }
-    
-    // Nouveau EPC 96 bits aléatoire
-    uint8_t new_epc[12];
-    generateRandomEpc(new_epc, 12);
-    String newEpcHex = bytesToHex(new_epc, 12);
-    
-    Serial.println("Target new EPC: " + newEpcHex);
-    Serial.print("New EPC bytes: ");
-    for (size_t i = 0; i < 12; i++) {
-      Serial.printf("%02X ", new_epc[i]);
-    }
-    Serial.println();
-    
-    WriteError err = writeEpcWithPc(new_epc, 12, ACCESS_PWD);
-    Serial.println("Write result: " + String(errorToString(err)));
-    
-    if (err == WRITE_OK) {
-      delay(100);
-      
-      // Vérifier avec notre parser universel
-      stopMultiInv(Serial2);
-      RawTagData verify_tags[8];
-      uint8_t n = rawInventoryWithRssi(verify_tags, 8);
-      bool found = false;
-      
-      Serial.println("\nVerification scan:");
-      for (uint8_t i = 0; i < n; i++) {
-        String s = verify_tags[i].epc;
-        Serial.println("  Found: " + s);
-        s.toUpperCase();
-        if (s == newEpcHex) {
-          found = true;
-          Serial.println("  -> MATCH! Write successful!");
-        }
-      }
-      
-      if (!found) {
-        Serial.println("  -> New EPC not found in verification");
-      }
-      
-      Serial.println("====================\n");
-      
-      // Affichage unifié avec DisplayManager
-      String verifyMsg = found ? "Verification: PASSED" : "Verification: FAILED";
-      DisplayManager::showWriteResult(true, verifyMsg, "", newEpcHex);
-    } else {
-      Serial.println("Write failed with error: " + String(errorToString(err)));
-      DisplayManager::showWriteResult(false, errorToString(err), "Check tag position and power");
+  } else {
+    if (M5.BtnB.pressedFor(800)) {        // ~0.8s pour changer de mode
+      cycleEpcMode();
+      // Anti-rebond long press : attendre release avant autre action
+      while (M5.BtnB.isPressed()) { M5.update(); delay(5); }
+    } else if (M5.BtnB.wasReleased()) {   // Short press → write
+      performEpcWrite();
     }
   }
 }
