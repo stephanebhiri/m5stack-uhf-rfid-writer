@@ -1178,6 +1178,20 @@ void loop() {
     Serial.println();
     
     WriteError err = writeEpcWithPc(new_epc, new_len, ACCESS_PWD);
+    
+    // Fallback : si échec avec INSUFFICIENT_POWER et taille > 96-bit, essayer en 96-bit
+    if (err == WRITE_UNKNOWN_ERROR && new_len > 12) {
+      Serial.println("Extended EPC write failed, trying 96-bit fallback...");
+      new_len = 12;  // Forcer 96-bit
+      generateRandomEpc(new_epc, new_len);  // Nouveau EPC 96-bit
+      Serial.print("Fallback EPC bytes: ");
+      for (size_t i = 0; i < new_len; i++) {
+        Serial.printf("%02X ", new_epc[i]);
+      }
+      Serial.println();
+      err = writeEpcWithPc(new_epc, new_len, ACCESS_PWD);
+    }
+    
     Serial.println("Write result: " + String(errorToString(err)));
     
     String hex_str = bytesToHex(new_epc, min(new_len, (size_t)12));
