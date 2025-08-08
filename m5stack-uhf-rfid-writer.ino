@@ -710,7 +710,7 @@ static bool restoreTag() {
   Serial.println("\n=== TAG RESTORE MODE ===");
   Serial.println("Attempting to restore bricked tag with common PC words...");
   
-  // PC words courants à tester
+  // PC words courants à tester + variantes observées dans les erreurs
   uint16_t restore_pcs[] = {
     0x3000,  // 96-bit standard
     0x3008,  // 96-bit avec XPC
@@ -718,10 +718,13 @@ static bool restoreTag() {
     0x4400,  // 128-bit variant
     0x4800,  // 128-bit avec protocol bits
     0x6000,  // 192-bit
-    0x8000   // 256-bit
+    0x8000,  // 256-bit
+    0x8400,  // Variante observée dans erreur 0x3008
+    0x4C00   // Variante observée dans erreur 0x6000
   };
   const char* pc_names[] = {
-    "96-bit std", "96-bit XPC", "128-bit std", "128-bit var", "128-bit proto", "192-bit", "256-bit"
+    "96-bit std", "96-bit XPC", "128-bit std", "128-bit var", "128-bit proto", 
+    "192-bit", "256-bit", "256-bit var", "192-bit var"
   };
   
   uint8_t test_epc[] = {0xAC, 0x71, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF}; // EPC test
@@ -736,23 +739,30 @@ static bool restoreTag() {
     // Essayer d'écrire ce PC word
     if (writePcWord(pc, ACCESS_PWD)) {
       delay(50);
+      Serial.print(" PC OK, testing scan...");
       
-      // Essayer d'écrire un EPC test de la bonne taille
-      if (bytes <= sizeof(test_epc)) {
-        WriteError result = writeEpcWithPc(test_epc, bytes, ACCESS_PWD);
-        if (result == WRITE_OK) {
-          Serial.printf(" SUCCESS! Tag restored with PC=0x%04X\n", pc);
-          
-          // Vérifier en scannant
-          delay(100);
-          stopMultiInv(Serial2);
-          uint8_t n = uhf.pollingOnce();
-          if (n > 0) {
-            Serial.println("Verification: Tag responds to scan!");
-            Serial.println("EPC: " + uhf.cards[0].epc_str);
+      // Tester si le tag répond au scan après changement PC
+      stopMultiInv(Serial2);
+      delay(50);
+      uint8_t n = uhf.pollingOnce();
+      if (n > 0) {
+        Serial.printf(" SCAN OK! EPC: %s", uhf.cards[0].epc_str.c_str());
+        
+        // Si scan OK, essayer d'écrire un EPC test
+        if (bytes <= sizeof(test_epc)) {
+          Serial.print(", testing EPC write...");
+          WriteError result = writeEpcWithPc(test_epc, bytes, ACCESS_PWD);
+          if (result == WRITE_OK) {
+            Serial.println(" FULL SUCCESS! Tag restored!");
+            return true;
+          } else {
+            Serial.printf(" EPC write failed (%s), but tag is scannable", errorToString(result));
+            // Tag partiellement fonctionnel = succès partiel
             return true;
           }
         }
+      } else {
+        Serial.print(" scan failed");
       }
     }
     Serial.println(" failed");
