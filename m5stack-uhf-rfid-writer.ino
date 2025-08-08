@@ -16,6 +16,9 @@ static constexpr uint32_t LONG_PRESS_DURATION = 1000;  // 1 seconde pour appui l
 static constexpr uint16_t BEEP_FREQ = 1000;     // Fréquence bip 1kHz (plus discret)
 static constexpr uint8_t BEEP_DURATION = 25;    // Durée bip 25ms (4x plus court)
 
+// === Debug toggle ===
+#define DEBUG_UHF_FRAMES 0  // Mettre à 1 pour activer le debug hex
+
 Unit_UHF_RFID uhf;
 
 // === Variables globales pour le mode continu ===
@@ -69,6 +72,23 @@ static uint8_t cs8(const uint8_t* p, size_t n) {
   return uint8_t(s & 0xFF);
 }
 
+#if DEBUG_UHF_FRAMES
+static void hexDump(const char* label, const uint8_t* data, size_t len) {
+  Serial.print(label);
+  Serial.print(": ");
+  for (size_t i = 0; i < len; i++) {
+    Serial.printf("%02X ", data[i]);
+    if (i > 0 && (i + 1) % 16 == 0) {
+      Serial.println();
+      Serial.print("    ");  // Indentation
+    }
+  }
+  Serial.println();
+}
+#else
+#define hexDump(label, data, len) ((void)0)
+#endif
+
 // Vidage complet du buffer RX avec timeout dynamique
 static void clearRxBuffer(HardwareSerial& s, uint32_t timeout = 50) {
   uint32_t start = millis();
@@ -94,6 +114,9 @@ static void stopMultiInv(HardwareSerial& s) {
 // === Envoi/recv bruts améliorés ===
 static bool sendCmdRaw(const uint8_t* frame, size_t len, uint8_t* resp, size_t& rlen, uint32_t tout_ms = CMD_TIMEOUT) {
   clearRxBuffer(Serial2, 20);
+  
+  hexDump("TX", frame, len);  // Debug envoi
+  
   Serial2.write(frame, len);
   Serial2.flush();
   
@@ -129,7 +152,33 @@ static bool sendCmdRaw(const uint8_t* frame, size_t len, uint8_t* resp, size_t& 
   }
   
   rlen = idx;
-  return (idx >= 7 && resp[0] == 0xBB && resp[idx-1] == 0x7E);
+  
+  // === Validation stricte de la trame ===
+  if (idx < 7) return false;  // Trame trop courte
+  if (resp[0] != 0xBB) return false;  // Mauvais header
+  if (resp[idx-1] != 0x7E) return false;  // Mauvais trailer
+  
+  // Vérifier longueur exacte
+  uint16_t pl = (resp[3] << 8) | resp[4];
+  size_t expected_len = 5 + pl + 2;  // Header(1) + Type(1) + CMD(1) + PL(2) + Data(pl) + CS(1) + Trailer(1)
+  
+  if (idx != expected_len) {
+    Serial.printf("Frame length mismatch: got %d, expected %d\n", idx, expected_len);
+    return false;
+  }
+  
+  // Vérifier checksum
+  uint8_t calculated_cs = cs8(&resp[1], expected_len - 3);  // Type + CMD + PL + Data
+  uint8_t received_cs = resp[idx - 2];  // CS avant trailer
+  
+  if (calculated_cs != received_cs) {
+    Serial.printf("Checksum mismatch: calc=0x%02X, recv=0x%02X\n", calculated_cs, received_cs);
+    hexDump("BAD_RX", resp, idx);  // Debug trame corrompue
+    return false;
+  }
+  
+  hexDump("RX", resp, idx);  // Debug réception
+  return true;
 }
 
 // === Analyse des erreurs ===
@@ -421,7 +470,7 @@ static bool writePcWord(uint16_t pc_word, uint32_t accessPwd) {
 static WriteError writeEpcWithPc(const uint8_t* epc, size_t epc_bytes, uint32_t accessPwd) {
   // Calculer le PC word
   uint16_t epc_words = epc_bytes / 2;
-  uint16_t pc_word = (epc_words << 11) | 0x3000;  // Length bits [15:11] + defaults
+  uint16_t pc_word = (epc_words << 11) | 0x0800;  // Length bits [15:11] + protocol control bits
   
   Serial.printf("Writing EPC: %d bytes, PC=0x%04X\n", epc_bytes, pc_word);
   
@@ -515,6 +564,26 @@ static String bytesToHex(const uint8_t* data, size_t len) {
     result += buf;
   }
   return result;
+}
+
+// Générer un EPC aléatoire de la longueur spécifiée
+static void generateRandomEpc(uint8_t* epc, size_t epc_bytes) {
+  // Utiliser un seed basé sur millis() + ADC pour plus d'entropie
+  uint32_t seed = millis() + analogRead(0) + esp_random();
+  randomSeed(seed);
+  
+  for (size_t i = 0; i < epc_bytes; i++) {
+    epc[i] = random(0, 256);
+  }
+  
+  // Préfixe reconnaissable pour identifier tes tags
+  if (epc_bytes >= 4) {
+    epc[0] = 0xAC;        // Préfixe custom
+    epc[1] = 0x71;        // "AC71" = signature
+    epc[2] = (millis() >> 8) & 0xFF;   // Timestamp pour unicité
+    epc[3] = millis() & 0xFF;          // Timestamp low
+    // Le reste (positions 4+) reste complètement aléatoire
+  }
 }
 
 // === Set Select Mode (commande 0x12) ===
@@ -932,13 +1001,10 @@ void loop() {
       return;
     }
     
-    // Nouveau EPC 96 bits
-    String newEpcHex = "302DB319A000000400009999";  // Exemple
+    // Nouveau EPC 96 bits aléatoire
     uint8_t new_epc[12];
-    if (!hexToBytes(newEpcHex, new_epc, 12)) {
-      displayStatus("Error", "Invalid hex");
-      return;
-    }
+    generateRandomEpc(new_epc, 12);
+    String newEpcHex = bytesToHex(new_epc, 12);
     
     Serial.println("Target new EPC: " + newEpcHex);
     Serial.print("New EPC bytes: ");
@@ -1061,14 +1127,12 @@ void loop() {
       return;
     }
     
-    // Générer un EPC de la bonne taille
+    // Générer un EPC aléatoire de la bonne taille
     uint8_t new_epc[62];
     size_t new_len = min(capacity, (size_t)24);  // Max 192 bits pour cet exemple
     
-    // Pattern exemple
-    for (size_t i = 0; i < new_len; i++) {
-      new_epc[i] = 0xAA + i;
-    }
+    // EPC aléatoire adapté à la taille
+    generateRandomEpc(new_epc, new_len);
     
     Serial.printf("Writing new EPC: %d bytes (%d bits)\n", new_len, new_len * 8);
     Serial.print("New EPC bytes: ");
