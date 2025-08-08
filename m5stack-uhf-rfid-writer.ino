@@ -490,21 +490,60 @@ static bool writePcWord(uint16_t pc_word, uint32_t accessPwd) {
   return true;
 }
 
-// === WRITE EPC avec gestion PC ===
-static WriteError writeEpcWithPc(const uint8_t* epc, size_t epc_bytes, uint32_t accessPwd) {
-  // Calculer le PC word
-  uint16_t epc_words = epc_bytes / 2;
-  // Bits de protocole selon la taille EPC  
-  uint16_t protocol_bits;
-  if (epc_bytes == 12) {
-    // Pour 96-bit, essayer d'abord 0x3000, puis 0x3008 si échec
-    protocol_bits = 0x3000;  // Standard EPC Gen2
-  } else {
-    protocol_bits = 0x0800;  // Pour tailles étendues
+// --- Helper : lire le PC word (bank EPC, word 1) ---
+static bool readPcWord(uint16_t& out_pc, uint32_t accessPwd = ACCESS_PWD) {
+  // READ (0x39), PL=9, Bank=EPC(0x01), WordPtr=1, WordCount=1
+  uint8_t frame[32]; size_t i = 0;
+  frame[i++] = 0xBB; frame[i++] = 0x00; frame[i++] = 0x39;
+  frame[i++] = 0x00; frame[i++] = 0x09;
+  // AccessPwd
+  frame[i++] = (accessPwd >> 24); frame[i++] = (accessPwd >> 16);
+  frame[i++] = (accessPwd >> 8);  frame[i++] = accessPwd;
+  // Bank / WordPtr / DL
+  frame[i++] = 0x01;              // EPC
+  frame[i++] = 0x00; frame[i++] = 0x01;   // WordPtr = 1 (PC)
+  frame[i++] = 0x00; frame[i++] = 0x01;   // DL = 1 word
+  // CS+END
+  frame[i++] = cs8(&frame[1], i - 1);
+  frame[i++] = 0x7E;
+
+  uint8_t resp[64]; size_t rlen = sizeof(resp);
+  if (!sendCmdRaw(frame, i, resp, rlen)) return false;
+  if (resp[2] != 0x39) return false;
+
+  // Deux formats possibles : DATA only (PL==2) ou UL+DATA
+  uint16_t pl = (resp[3] << 8) | resp[4];
+  if (pl == 2) {
+    out_pc = (uint16_t(resp[5]) << 8) | resp[6];
+    return true;
   }
-  uint16_t pc_word = (epc_words << 11) | protocol_bits;
-  
-  Serial.printf("Writing EPC: %d bytes, PC=0x%04X\n", epc_bytes, pc_word);
+  if (pl >= 3) {
+    uint8_t ul = resp[5];
+    size_t off = 6 + ul;
+    if (off + 2 <= rlen - 2) {
+      out_pc = (uint16_t(resp[off]) << 8) | resp[off + 1];
+      return true;
+    }
+  }
+  return false;
+}
+
+// === WRITE EPC avec gestion PC ===
+// --- Remplacement : writeEpcWithPc en préservant les flags bas du PC ---
+static WriteError writeEpcWithPc(const uint8_t* epc, size_t epc_bytes, uint32_t accessPwd) {
+  if (!epc || epc_bytes == 0 || (epc_bytes & 1)) return WRITE_UNKNOWN_ERROR;
+
+  // 1) Lire PC existant et en extraire les flags bas
+  uint16_t old_pc = 0;
+  if (!readPcWord(old_pc, accessPwd)) {
+    Serial.println("[PC] read failed");
+    return WRITE_UNKNOWN_ERROR;
+  }
+  const uint16_t lower_flags = (old_pc & 0x07FF);      // conserve XPC/ISO/etc.
+  const uint16_t new_words   = epc_bytes / 2;
+  const uint16_t pc_word     = uint16_t((new_words << 11) | lower_flags);
+
+  Serial.printf("[PC] old=0x%04X  new=0x%04X  (words=%u)\n", old_pc, pc_word, new_words);
   
   // Vérification puissance pour EPC > 96-bit
   if (epc_bytes > 12 && current_power_index < 2) {
