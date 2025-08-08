@@ -3,7 +3,7 @@
 // Version robuste avec buffer optimisé et gestion PC word
 
 #include <M5Unified.h>
-#include "UNIT_UHF_RFID.h"
+// #include "UNIT_UHF_RFID.h"  // Plus besoin - 100% raw!
 #include "universal_inventory.h"
 
 // === Codes d'erreur ===
@@ -31,7 +31,7 @@ static constexpr uint8_t BEEP_DURATION = 25;    // Durée bip 25ms (4x plus cour
 // === Debug toggle ===
 #define DEBUG_UHF_FRAMES 0  // Mettre à 1 pour activer le debug hex
 
-Unit_UHF_RFID uhf;
+// Unit_UHF_RFID uhf; // Plus besoin - 100% raw implementation!
 
 // === Variables globales pour le mode continu ===
 bool continuous_scan_active = false;
@@ -245,7 +245,7 @@ static void stopMultiInv(HardwareSerial& s) {
 }
 
 // === Envoi/recv bruts améliorés ===
-static bool sendCmdRaw(const uint8_t* frame, size_t len, uint8_t* resp, size_t& rlen, uint32_t tout_ms = CMD_TIMEOUT) {
+bool sendCmdRaw(const uint8_t* frame, size_t len, uint8_t* resp, size_t& rlen, uint32_t tout_ms) {
   clearRxBuffer(Serial2, 20);
   
   hexDump("TX", frame, len);  // Debug envoi
@@ -316,82 +316,75 @@ static bool sendCmdRaw(const uint8_t* frame, size_t len, uint8_t* resp, size_t& 
 
 // === Inventory raw avec RSSI - Utilise le parser GPT-5 ===
 static uint8_t rawInventoryWithRssi(RawTagData* tags, uint8_t max_tags) {
-  return ::rawInventoryWithRssi(tags, max_tags);
+  return rawInventoryWithRssiGPT5(tags, max_tags);
 }
 
-// === SELECT raw pour sélectionner un tag spécifique ===
+// === SELECT raw en copiant exactement le format M5Stack ===
 static bool rawSelect(const uint8_t* epc, size_t epc_len, uint32_t access_pwd = 0) {
-  if (!epc || epc_len == 0 || epc_len > 31) {
-    Serial.println("❌ Invalid EPC for select");
+  if (!epc || epc_len != 12) {  // M5Stack expect exactly 12 bytes EPC
+    Serial.printf("❌ Invalid EPC for M5Stack select: %d bytes (need 12)\n", epc_len);
     return false;
   }
   
-  // Commande SELECT 0x0C
-  // Format: Target(1) + Action(1) + MemBank(1) + Pointer(4) + Length(1) + Truncate(1) + Mask(variable)
-  uint8_t select_cmd[64];
-  size_t idx = 0;
+  // Copier exactement SET_SELECT_PARAMETER_CMD de M5Stack
+  uint8_t select_cmd[] = {0xBB, 0x00, 0x0C, 0x00, 0x13, 0x01, 0x00, 0x00, 0x00,
+                          0x20, 0x60, 0x00, 0x30, 0x75, 0x1F, 0xEB, 0x70, 0x5C,
+                          0x59, 0x04, 0xE3, 0xD5, 0x0D, 0x70, 0xAD, 0x7E};
   
-  select_cmd[idx++] = 0xBB;    // Header
-  select_cmd[idx++] = 0x00;    // Type  
-  select_cmd[idx++] = 0x0C;    // CMD = SELECT
+  // Remplacer les 12 bytes EPC par les nôtres (positions 12-23)
+  for (uint8_t i = 0; i < 12; i++) {
+    select_cmd[12 + i] = epc[i];
+  }
   
-  uint16_t pl = 4 + 1 + 1 + 4 + 1 + 1 + epc_len;  // Access(4) + Target + Action + MemBank + Pointer(4) + Length + Truncate + EPC
-  select_cmd[idx++] = (pl >> 8);   // PL_H
-  select_cmd[idx++] = (pl & 0xFF); // PL_L
+  // Recalculer checksum (position 24)
+  uint8_t check = 0;
+  for (uint8_t i = 1; i < 24; i++) {
+    check += select_cmd[i];
+  }
+  select_cmd[24] = check & 0xFF;
   
-  // Access Password (4 bytes)
-  select_cmd[idx++] = (access_pwd >> 24);
-  select_cmd[idx++] = (access_pwd >> 16); 
-  select_cmd[idx++] = (access_pwd >> 8);
-  select_cmd[idx++] = access_pwd;
-  
-  // SELECT parameters
-  select_cmd[idx++] = 0x01;    // Target = Session S0
-  select_cmd[idx++] = 0x00;    // Action = Assert SL or inventoried -> A
-  select_cmd[idx++] = 0x01;    // MemBank = EPC (0x01)
-  
-  // Pointer (4 bytes) = bit offset in memory bank (32 bits for PC word = skip PC)
-  select_cmd[idx++] = 0x00;    // Pointer[31:24]
-  select_cmd[idx++] = 0x00;    // Pointer[23:16] 
-  select_cmd[idx++] = 0x00;    // Pointer[15:8]
-  select_cmd[idx++] = 0x20;    // Pointer[7:0] = 32 bits (skip PC word)
-  
-  select_cmd[idx++] = epc_len * 8;  // Length = EPC length in bits
-  select_cmd[idx++] = 0x00;    // Truncate = No
-  
-  // EPC Mask
-  memcpy(&select_cmd[idx], epc, epc_len);
-  idx += epc_len;
-  
-  // Checksum
-  select_cmd[idx] = cs8(&select_cmd[1], idx - 1);
-  idx++;
-  select_cmd[idx++] = 0x7E;    // Trailer
-  
-  Serial.printf("Selecting EPC: ");
-  for (size_t i = 0; i < epc_len; i++) {
+  Serial.printf("M5Stack SELECT with EPC: ");
+  for (size_t i = 0; i < 12; i++) {
     Serial.printf("%02X", epc[i]);
   }
-  Serial.printf(" (%d bytes)\n", epc_len);
+  Serial.println();
   
   uint8_t resp[32];
   size_t rlen = sizeof(resp);
   
-  if (!sendCmdRaw(select_cmd, idx, resp, rlen, 500)) {
+  if (!sendCmdRaw(select_cmd, sizeof(select_cmd), resp, rlen, 500)) {
     Serial.println("❌ SELECT command failed");
     return false;
   }
   
-  // Analyser la réponse
-  if (resp[0] == 0xBB && resp[2] == 0x0C) {
-    Serial.println("✅ SELECT successful");
-    return true;
-  } else if (resp[2] == 0xFF && rlen > 5) {
-    Serial.printf("❌ SELECT error: 0x%02X\n", resp[5]);
-    return false;
+  Serial.printf("SELECT resp: ");
+  for (size_t i = 0; i < min(rlen, (size_t)10); i++) {
+    Serial.printf("%02X ", resp[i]);
+  }
+  Serial.println();
+  
+  // Vérifier réponse OK: {0xBB, 0x01, 0x0C, 0x00, 0x01, 0x00, 0x0E, 0x7E}
+  const uint8_t expected[] = {0xBB, 0x01, 0x0C, 0x00, 0x01, 0x00, 0x0E, 0x7E};
+  if (rlen == 8) {
+    bool match = true;
+    for (int i = 0; i < 8; i++) {
+      if (resp[i] != expected[i]) {
+        match = false;
+        break;
+      }
+    }
+    if (match) {
+      Serial.println("✅ M5Stack SELECT successful");
+      return true;
+    }
   }
   
-  Serial.println("❌ SELECT unexpected response");
+  if (resp[2] == 0xFF && rlen > 5) {
+    Serial.printf("❌ SELECT error: 0x%02X\n", resp[5]);
+  } else {
+    Serial.println("❌ SELECT unexpected response");
+  }
+  
   return false;
 }
 
@@ -578,7 +571,7 @@ static bool readTid(uint8_t tid[8]) {
   uint8_t resp[256];
   size_t rlen = sizeof(resp);
   
-  if (!sendCmdRaw(frame, i, resp, rlen)) {
+  if (!sendCmdRaw(frame, i, resp, rlen, 500)) {
     return false;
   }
   
@@ -606,13 +599,8 @@ static bool readTid(uint8_t tid[8]) {
   return false;
 }
 
-// === Select par EPC simple (utilise la lib) ===
-static bool selectByEpc(Unit_UHF_RFID& uhf_ref, const uint8_t* epc, size_t epc_len) {
-  // La lib attend un non-const, faire une copie temporaire
-  uint8_t epc_copy[62];
-  memcpy(epc_copy, epc, min(epc_len, sizeof(epc_copy)));
-  return uhf_ref.select(epc_copy);
-}
+// === Fonction obsolète - remplacée par rawSelect() ===
+// static bool selectByEpc() - removed, use rawSelect() instead
 
 // === Select par TID (format corrigé) ===
 static bool selectByTid(const uint8_t tid[8]) {
@@ -649,7 +637,7 @@ static bool selectByTid(const uint8_t tid[8]) {
   uint8_t resp[128];
   size_t rlen = sizeof(resp);
   
-  bool result = sendCmdRaw(frame, i, resp, rlen);
+  bool result = sendCmdRaw(frame, i, resp, rlen, 500);
   
   // Debug
   if (result) {
@@ -748,7 +736,7 @@ static bool writePcWord(uint16_t pc_word, uint32_t accessPwd) {
   uint8_t resp[128];
   size_t rlen = sizeof(resp);
   
-  if (!sendCmdRaw(frame, i, resp, rlen)) {
+  if (!sendCmdRaw(frame, i, resp, rlen, 500)) {
     Serial.println("PC Write: No response from module");
     return false;
   }
@@ -828,7 +816,7 @@ static WriteError writeEpcWithPc(const uint8_t* epc, size_t epc_bytes, uint32_t 
   uint8_t resp[32];
   size_t rlen = sizeof(resp);
   
-  if (sendCmdRaw(read_cmd, sizeof(read_cmd), resp, rlen) && resp[2] == 0x39) {
+  if (sendCmdRaw(read_cmd, sizeof(read_cmd), resp, rlen, 500) && resp[2] == 0x39) {
     // Succès de lecture
     if (rlen >= 7) {
       uint16_t current_pc = (resp[5] << 8) | resp[6];
@@ -925,7 +913,7 @@ static WriteError writeEpcWithPc(const uint8_t* epc, size_t epc_bytes, uint32_t 
   uint8_t epc_resp[64];
   size_t epc_rlen = sizeof(epc_resp);
   
-  if (!sendCmdRaw(buf, i, epc_resp, epc_rlen)) {
+  if (!sendCmdRaw(buf, i, epc_resp, epc_rlen, 1000)) {
     Serial.println("❌ EPC WRITE FAILED: No response or timeout");
     Serial.println("Possible causes:");
     Serial.println("  - Module not responding");
@@ -1296,7 +1284,7 @@ static void processContinuousScan() {
       String tid_str = "N/A";
       uint8_t epc_bytes[31];
       if (hexToBytes(epc_str, epc_bytes, 31)) {
-        if (rawSelect(epc_bytes, epc_hex.length() / 2)) {
+        if (rawSelect(epc_bytes, epc_str.length() / 2)) {
           uint8_t tid_buf[8];
           if (readTid(tid_buf)) {
             tid_str = bytesToHex(tid_buf, 8).substring(0, 8); // Premier 8 chars du TID
@@ -1546,6 +1534,7 @@ void loop() {
         Serial.println("Re-scan found EPC: " + rescan_tags[0].epc);
         uint8_t epc_bytes[31];
         if (hexToBytes(rescan_tags[0].epc, epc_bytes, 31)) {
+          size_t epc_len = rescan_tags[0].epc.length() / 2;
           selected = rawSelect(epc_bytes, epc_len);
           Serial.println("Select after poll: " + String(selected));
         }
