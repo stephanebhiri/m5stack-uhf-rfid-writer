@@ -10,11 +10,38 @@
   - Optional debug via DEBUG_RSSI
   - Heap-friendly (string reserve)
   ---------------------------------------------------------
-  Expects an implementation of:
-    bool sendCmdRaw(const uint8_t* frame, size_t len,
-                    uint8_t* resp, size_t& rlen,
-                    uint32_t tout_ms = 200);
 */
+
+// -------- UHF RAW API (propre/modulaire) --------
+// Attache le port série UHF (ex: &Serial2)
+void uhfAttachSerial(HardwareSerial* port);
+
+// Stoppe l'inventory multi (commande 0x28)
+void uhfStopMultiInventory();
+
+// SELECT générique sur EPC (supporte 6..31 words)
+bool uhfSelectEpc(const uint8_t* epc, size_t epc_len_bytes);
+
+// SELECT par TID 64-bit
+bool uhfSelectTid64(const uint8_t tid[8]);
+
+// READ/WRITE bruts (0x39 / 0x49)
+int  uhfRead(uint8_t bank, uint16_t word_ptr, uint8_t* data,
+             size_t max_len_bytes, uint8_t word_count, uint32_t access_pwd=0);
+bool uhfWrite(uint8_t bank, uint16_t word_ptr, const uint8_t* data,
+              size_t data_len_bytes, uint32_t access_pwd=0);
+
+// Écriture du PC word (bank EPC, word 1)
+bool uhfWritePcWord(uint16_t pc_word, uint32_t access_pwd=0);
+
+// Lecture EPC complète via PC word (source de vérité)
+bool uhfReadEpcViaPc(uint8_t* epc_buf, size_t& epc_len_bytes,
+                     uint16_t& out_pc, uint32_t access_pwd=0);
+
+// Helper : écriture "PC + EPC" en un seul workflow (tu peux l'appeler
+// depuis ta logique higher-level si tu veux factoriser)
+bool uhfWritePcAndEpc(uint16_t new_pc, const uint8_t* epc,
+                      uint8_t epc_words, uint32_t access_pwd=0);
 
 // #define DEBUG_RSSI  // opt-in
 
@@ -25,7 +52,7 @@ static constexpr uint8_t FRAME_HEADER    = 0xBB;
 static constexpr uint8_t FRAME_TRAILER   = 0x7E;
 static constexpr uint8_t CMD_ERROR       = 0xFF;
 
-// Forward declaration - implemented in .ino
+// Forward declaration - implemented in .ino (for inventory only)
 extern bool sendCmdRaw(const uint8_t* frame, size_t len,
                        uint8_t* resp, size_t& rlen,
                        uint32_t tout_ms);
@@ -83,78 +110,10 @@ static inline int8_t _rssibyte_to_dbm(uint8_t v, RssiProfile profile = RSSI_CURV
 }
 
 // ---------- Frame IO (multi-frame support) ----------
-/* Read ONE complete frame currently waiting on Serial2 without sending anything */
-static bool _readOneFrame(uint8_t* buf, size_t& len, uint32_t tout_ms) {
-  if (!buf || len < 7) return false;
-  size_t idx = 0; bool started = false; uint32_t t0 = millis();
-  while (millis() - t0 < tout_ms && idx < len) {
-    if (Serial2.available()) {
-      uint8_t b = (uint8_t)Serial2.read();
-      if (!started) {
-        if (b == FRAME_HEADER) { started = true; buf[idx++] = b; }
-      } else {
-        buf[idx++] = b;
-        if (idx >= 5) {
-          uint16_t pl = (uint16_t(buf[3]) << 8) | buf[4];
-          size_t expected = 5 + pl + 2;
-          if (idx >= expected) break;
-        }
-      }
-    }
-  }
-  if (idx < 7 || buf[0] != FRAME_HEADER) {
-#ifdef DEBUG_RSSI
-    if (idx > 0) Serial.printf("⚠️ Incomplete frame: got %u bytes\n", (unsigned)idx);
-#endif
-    return false;
-  }
-  uint16_t pl = (uint16_t(buf[3]) << 8) | buf[4];
-  size_t expected = 5 + pl + 2;
-  if (idx != expected || buf[idx-1] != FRAME_TRAILER) {
-#ifdef DEBUG_RSSI
-    Serial.printf("⚠️ Frame validation failed: got %u, expected %u\n", (unsigned)idx, (unsigned)expected);
-#endif
-    return false;
-  }
-  if (_cs8(&buf[1], expected - 3) != buf[idx-2]) {
-#ifdef DEBUG_RSSI
-    Serial.println("⚠️ Checksum validation failed");
-#endif
-    return false;
-  }
-  len = idx;
-  return true;
-}
-
-/* Send ONCE, then read zero or more additional frames (CMD 0x27 use-case) */
-static bool sendCmdRawMultiFrame(const uint8_t* frame, size_t len,
-                                 uint8_t* resp, size_t& rlen,
-                                 uint32_t tout_ms = 200) {
-  if (!frame || !resp || rlen < 7) return false;
-
-  // 1) Send ONCE and get the first frame
-  size_t first_len = rlen;
-  if (!sendCmdRaw(frame, len, resp, first_len, tout_ms)) return false;
-  size_t total = first_len;
-
-#ifdef DEBUG_RSSI
-  Serial.printf("📥 First frame: %u bytes\n", (unsigned)first_len);
-#endif
-
-  // 2) Read subsequent frames until timeout or buffer full
-  uint32_t t0 = millis();
-  while (millis() - t0 < tout_ms && total + 7 < rlen) {
-    size_t slot = rlen - total;
-    if (!_readOneFrame(resp + total, slot, 40)) break;
-    total += slot;
-#ifdef DEBUG_RSSI
-    Serial.printf("📥 Next frame: %u bytes (total: %u)\n", (unsigned)slot, (unsigned)total);
-#endif
-  }
-
-  rlen = total;
-  return total > 0;
-}
+// Implemented in universal_inventory.cpp (uses the attached HardwareSerial*)
+bool sendCmdRawMultiFrame(const uint8_t* frame, size_t len,
+                          uint8_t* resp, size_t& rlen,
+                          uint32_t tout_ms = 200);
 
 // ---------- Payload parser ----------
 static uint8_t _parseInventoryPayload(const uint8_t* payload, size_t plen,

@@ -6,6 +6,13 @@
 // #include "UNIT_UHF_RFID.h"  // Plus besoin - 100% raw!
 #include "universal_inventory.h"
 
+// We need the module's port here
+extern HardwareSerial* gUhf;   // defined in universal_inventory.cpp
+
+// hex utils (prototypes so we can call them before their body)
+static bool   hexToBytes(const String& hex, uint8_t* out, size_t max_bytes);
+static String bytesToHex(const uint8_t* data, size_t len);
+
 // === Codes d'erreur ===
 enum WriteError {
   WRITE_OK = 0,
@@ -20,10 +27,9 @@ enum WriteError {
 
 // Forward declarations
 static const char* getCurrentPowerText();
-static bool selectByEpcRaw(const uint8_t* epc, size_t epc_len);
+// selectByEpcRaw supprimée - utiliser uhfSelectEpc()
 static void updateMultiTagDisplay();
-static bool selectByTid(const uint8_t tid[8]);          // + add proto (déjà implémentée plus bas)
-static bool readEpcFullFromPcRaw(uint8_t* epc, size_t& epc_len, uint16_t& out_pc); // + new proto
+// selectByTid et readEpcFullFromPcRaw supprimées - utiliser uhfSelectTid64() et uhfReadEpcViaPc()
 static WriteError writeEpcVariableSafeWithVerifyRaw(const uint8_t* epc, size_t epc_bytes, uint32_t accessPwd); // + new proto
 
 // === Configuration ===
@@ -224,7 +230,7 @@ struct TagInfo {
   bool has_tid;
 };
 
-TagInfo current_tag;
+TagInfo current_tag = { {0}, {0}, 0, 0, false };
 
 
 // === Utils protocole EL-UHF-RMT01/JRD-4035 ===
@@ -264,31 +270,25 @@ static void clearRxBuffer(HardwareSerial& s, uint32_t timeout = 50) {
 }
 
 // Stop multi-inventaire amélioré
-static void stopMultiInv(HardwareSerial& s) {
-  const uint8_t stop[] = {0xBB, 0x00, 0x28, 0x00, 0x00, 0x28, 0x7E};
-  clearRxBuffer(s, 20);
-  s.write(stop, sizeof(stop));
-  s.flush();
-  delay(60);
-  clearRxBuffer(s, 30);
-}
+// stopMultiInv supprimée - utiliser uhfStopMultiInventory()
 
 // === Envoi/recv bruts améliorés ===
 bool sendCmdRaw(const uint8_t* frame, size_t len, uint8_t* resp, size_t& rlen, uint32_t tout_ms) {
-  clearRxBuffer(Serial2, 20);
+  if (!gUhf) return false;
+  clearRxBuffer(*gUhf, 20);
   
   hexDump("TX", frame, len);  // Debug envoi
   
-  Serial2.write(frame, len);
-  Serial2.flush();
+  gUhf->write(frame, len);
+  gUhf->flush();
   
   uint32_t t0 = millis();
   size_t idx = 0;
   bool frame_started = false;
   
   while (millis() - t0 < tout_ms && idx < rlen) {
-    if (Serial2.available()) {
-      uint8_t b = (uint8_t)Serial2.read();
+    if (gUhf->available()) {
+      uint8_t b = (uint8_t)gUhf->read();
       
       // Attendre le début de trame 0xBB
       if (!frame_started) {
@@ -348,7 +348,7 @@ static bool rawSelect(const uint8_t* epc, size_t epc_len, uint32_t access_pwd = 
   
   if (epc_len != 12) {
     // Fallback générique si EPC ≠ 96 bits
-    return selectByEpcRaw(epc, epc_len);
+    return uhfSelectEpc(epc, epc_len);
   }
   
   // Copier exactement SET_SELECT_PARAMETER_CMD de M5Stack
@@ -414,131 +414,9 @@ static bool rawSelect(const uint8_t* epc, size_t epc_len, uint32_t access_pwd = 
 }
 
 // === WRITE raw pour écriture directe ===
-static bool rawWrite(uint8_t bank, uint16_t word_ptr, const uint8_t* data, size_t data_len, uint32_t access_pwd = 0) {
-  if (!data || data_len == 0 || data_len > 62) {
-    Serial.println("❌ Invalid data for write");
-    return false;
-  }
-  
-  // Commande WRITE 0x49
-  uint8_t write_cmd[128];
-  size_t idx = 0;
-  
-  write_cmd[idx++] = 0xBB;     // Header
-  write_cmd[idx++] = 0x00;     // Type
-  write_cmd[idx++] = 0x49;     // CMD = WRITE
-  
-  uint16_t pl = 4 + 1 + 2 + 1 + data_len;  // Access(4) + Bank(1) + WordPtr(2) + WordCount(1) + Data
-  write_cmd[idx++] = (pl >> 8);    // PL_H
-  write_cmd[idx++] = (pl & 0xFF);  // PL_L
-  
-  // Access Password (4 bytes)
-  write_cmd[idx++] = (access_pwd >> 24);
-  write_cmd[idx++] = (access_pwd >> 16);
-  write_cmd[idx++] = (access_pwd >> 8); 
-  write_cmd[idx++] = access_pwd;
-  
-  // WRITE parameters
-  write_cmd[idx++] = bank;              // Bank (0x01=EPC, 0x02=TID, 0x03=User)
-  write_cmd[idx++] = (word_ptr >> 8);   // WordPtr high
-  write_cmd[idx++] = (word_ptr & 0xFF); // WordPtr low
-  write_cmd[idx++] = data_len / 2;      // WordCount (data_len in bytes / 2)
-  
-  // Data to write
-  memcpy(&write_cmd[idx], data, data_len);
-  idx += data_len;
-  
-  // Checksum
-  write_cmd[idx] = cs8(&write_cmd[1], idx - 1);
-  idx++;
-  write_cmd[idx++] = 0x7E;     // Trailer
-  
-  Serial.printf("Writing %d bytes to bank %d, word %d\n", data_len, bank, word_ptr);
-  
-  uint8_t resp[32];
-  size_t rlen = sizeof(resp);
-  
-  if (!sendCmdRaw(write_cmd, idx, resp, rlen, 1000)) {
-    Serial.println("❌ WRITE command failed");
-    return false;
-  }
-  
-  // Analyser la réponse
-  if (resp[0] == 0xBB && resp[2] == 0x49) {
-    Serial.println("✅ WRITE successful");
-    return true;
-  } else if (resp[2] == 0xFF && rlen > 5) {
-    Serial.printf("❌ WRITE error: 0x%02X\n", resp[5]);
-    return false;
-  }
-  
-  Serial.println("❌ WRITE unexpected response");
-  return false;
-}
+// rawWrite supprimée - utiliser uhfWrite()
 
-// === READ raw pour lecture directe ===
-static int rawRead(uint8_t bank, uint16_t word_ptr, uint8_t* data, size_t max_len, uint8_t word_count, uint32_t access_pwd = 0) {
-  if (!data || max_len == 0) {
-    Serial.println("❌ Invalid buffer for read");
-    return -1;
-  }
-  
-  // Commande READ 0x39
-  uint8_t read_cmd[32];
-  size_t idx = 0;
-  
-  read_cmd[idx++] = 0xBB;     // Header
-  read_cmd[idx++] = 0x00;     // Type
-  read_cmd[idx++] = 0x39;     // CMD = READ
-  
-  uint16_t pl = 4 + 1 + 2 + 1;  // Access(4) + Bank(1) + WordPtr(2) + WordCount(1)
-  read_cmd[idx++] = (pl >> 8);    // PL_H
-  read_cmd[idx++] = (pl & 0xFF);  // PL_L
-  
-  // Access Password (4 bytes)
-  read_cmd[idx++] = (access_pwd >> 24);
-  read_cmd[idx++] = (access_pwd >> 16);
-  read_cmd[idx++] = (access_pwd >> 8);
-  read_cmd[idx++] = access_pwd;
-  
-  // READ parameters
-  read_cmd[idx++] = bank;              // Bank (0x01=EPC, 0x02=TID, 0x03=User) 
-  read_cmd[idx++] = (word_ptr >> 8);   // WordPtr high
-  read_cmd[idx++] = (word_ptr & 0xFF); // WordPtr low
-  read_cmd[idx++] = word_count;        // WordCount
-  
-  // Checksum
-  read_cmd[idx] = cs8(&read_cmd[1], idx - 1);
-  idx++;
-  read_cmd[idx++] = 0x7E;     // Trailer
-  
-  Serial.printf("Reading %d words from bank %d, word %d\n", word_count, bank, word_ptr);
-  
-  uint8_t resp[128];
-  size_t rlen = sizeof(resp);
-  
-  if (!sendCmdRaw(read_cmd, idx, resp, rlen, 500)) {
-    Serial.println("❌ READ command failed");
-    return -1;
-  }
-  
-  // Analyser la réponse
-  if (resp[0] == 0xBB && resp[2] == 0x39 && rlen > 7) {
-    uint16_t resp_pl = (resp[3] << 8) | resp[4];
-    size_t bytes_to_copy = min(resp_pl, (uint16_t)max_len);
-    bytes_to_copy = min(bytes_to_copy, rlen - 7);  // 5 header + CS + trailer
-    
-    memcpy(data, &resp[5], bytes_to_copy);
-    Serial.printf("✅ READ successful: %d bytes\n", bytes_to_copy);
-    return bytes_to_copy;
-  } else if (resp[2] == 0xFF && rlen > 5) {
-    Serial.printf("❌ READ error: 0x%02X\n", resp[5]);
-    return -1;
-  }
-  
-  Serial.println("❌ READ unexpected response");
-  return -1;
-}
+// rawRead supprimée - utiliser uhfRead()
 
 // === Analyse des erreurs ===
 static WriteError parseWriteError(uint8_t error_code) {
@@ -629,175 +507,12 @@ static bool readTid(uint8_t tid[8]) {
 // static bool selectByEpc() - removed, use rawSelect() instead
 
 // === Select par TID (format corrigé) ===
-static bool selectByTid(const uint8_t tid[8]) {
-  uint8_t frame[32];
-  size_t i = 0;
-  
-  frame[i++] = 0xBB;
-  frame[i++] = 0x00;
-  frame[i++] = 0x0C;  // CMD = Select
-  frame[i++] = 0x00;
-  frame[i++] = 0x13;  // PL = 19
-  
-  frame[i++] = 0x01;  // Target = 0x01 pour Session S0
-  frame[i++] = 0x00;  // Action = 0x00
-  frame[i++] = 0x02;  // MemBank = 0x02 (TID)
-  
-  // Pointer en bits (0 = début du TID)
-  frame[i++] = 0x00;
-  frame[i++] = 0x00;
-  frame[i++] = 0x00;
-  frame[i++] = 0x00;
-  
-  frame[i++] = 0x40;  // Length = 0x40 = 64 bits
-  frame[i++] = 0x00;  // Truncate = 0x00 (No)
-  
-  // TID data (8 bytes)
-  memcpy(&frame[i], tid, 8);
-  i += 8;
-  
-  uint8_t cs = cs8(&frame[1], i - 1);
-  frame[i++] = cs;
-  frame[i++] = 0x7E;
-  
-  uint8_t resp[128];
-  size_t rlen = sizeof(resp);
-  
-  bool result = sendCmdRaw(frame, i, resp, rlen, 500);
-  
-  // Debug
-  if (result) {
-    Serial.print("Select TID resp: ");
-    for (size_t k = 0; k < min(rlen, (size_t)20); k++) {
-      Serial.printf("%02X ", resp[k]);
-    }
-    Serial.println();
-  }
-  
-  return result && resp[2] == 0x0C;
-}
+// selectByTid supprimée - utiliser uhfSelectTid64()
 
-// === Select par EPC format raw (alternative) ===
-static bool selectByEpcRaw(const uint8_t* epc, size_t epc_len) {
-  if (!epc || epc_len == 0) return false;
-  // Clip dur à 31 bytes (248 bits) pour cohérence longueur bits/payload
-  size_t epc_len_clip = epc_len > 31 ? 31 : epc_len;
-
-  uint8_t frame[96];
-  size_t i = 0;
-
-  frame[i++] = 0xBB;
-  frame[i++] = 0x00;
-  frame[i++] = 0x0C;  // CMD = Select
-
-  // PL = 11 bytes params + EPC data (clippé)
-  const uint16_t pl = 11 + epc_len_clip;
-  frame[i++] = (pl >> 8);
-  frame[i++] = (pl & 0xFF);
-
-  frame[i++] = 0x01;  // Target = Session S0
-  frame[i++] = 0x00;  // Action = 0x00
-  frame[i++] = 0x01;  // MemBank = EPC
-
-  // Pointer = 0x20 bits (début EPC après CRC+PC)
-  frame[i++] = 0x00;
-  frame[i++] = 0x00;
-  frame[i++] = 0x00;
-  frame[i++] = 0x20;
-
-  // Length en bits (1 octet), déjà clippé à 248 (=31 bytes)
-  uint8_t bit_len = (uint8_t)(epc_len_clip * 8);
-  frame[i++] = bit_len;
-
-  frame[i++] = 0x00;  // Truncate = No
-
-  // EPC data
-  memcpy(&frame[i], epc, epc_len_clip);
-  i += epc_len_clip;
-
-  // CS + trailer
-  uint8_t cs = cs8(&frame[1], i - 1);
-  frame[i++] = cs;
-  frame[i++] = 0x7E;
-
-  uint8_t resp[128];
-  size_t rlen = sizeof(resp);
-  bool ok = sendCmdRaw(frame, i, resp, rlen, 200);
-
-#ifdef DEBUG_UHF_FRAMES
-  if (ok) {
-    Serial.print("Select EPC resp: ");
-    for (size_t k = 0; k < min(rlen, (size_t)20); k++) Serial.printf("%02X ", resp[k]);
-    Serial.println();
-  }
-#endif
-
-  return ok && rlen >= 6 && resp[2] == 0x0C;  // ACK du module
-}
+// selectByEpcRaw supprimée - utiliser uhfSelectEpc()
 
 
-// === Écriture PC word ===
-static bool writePcWord(uint16_t pc_word, uint32_t accessPwd) {
-  uint8_t frame[32];
-  size_t i = 0;
-  
-  frame[i++] = 0xBB;
-  frame[i++] = 0x00;
-  frame[i++] = 0x49;  // WRITE
-  frame[i++] = 0x00;
-  frame[i++] = 0x0B;  // PL = 11 (9 + 2 bytes data)
-  
-  // AccessPwd
-  frame[i++] = (accessPwd >> 24);
-  frame[i++] = (accessPwd >> 16);
-  frame[i++] = (accessPwd >> 8);
-  frame[i++] = accessPwd;
-  
-  frame[i++] = 0x01;  // Bank = EPC
-  frame[i++] = 0x00;
-  frame[i++] = 0x01;  // WordPtr = 1 (PC word)
-  frame[i++] = 0x00;
-  frame[i++] = 0x01;  // WordCount = 1
-  
-  frame[i++] = (pc_word >> 8);
-  frame[i++] = (pc_word & 0xFF);
-  
-  uint8_t cs = cs8(&frame[1], i - 1);
-  frame[i++] = cs;
-  frame[i++] = 0x7E;
-  
-  uint8_t resp[128];
-  size_t rlen = sizeof(resp);
-  
-  if (!sendCmdRaw(frame, i, resp, rlen, 500)) {
-    Serial.println("PC Write: No response from module");
-    return false;
-  }
-  
-  if (resp[2] != 0x49) {
-    Serial.printf("PC Write failed: CMD=0x%02X, Status=0x%02X", resp[2], rlen >= 6 ? resp[5] : 0xFF);
-    if (rlen >= 6) {
-      uint16_t pl = (resp[3] << 8) | resp[4];
-      Serial.printf(", PL=%u", pl);
-      if (pl > 0 && rlen >= 6 + pl) {
-        Serial.printf(", Data:");
-        for (uint16_t j = 0; j < pl; j++) {
-          Serial.printf(" %02X", resp[5 + j]);
-        }
-        // Pour les erreurs, ne pas essayer d'interpréter comme PC
-        if (pl >= 2 && resp[2] == 0x49) {  // Seulement si succès
-          uint16_t current_pc = (resp[5] << 8) | resp[6];
-          Serial.printf(" (Current PC: 0x%04X)", current_pc);
-        }
-      }
-    }
-    Serial.println();
-    return false;
-  }
-  
-  Serial.printf("PC Write success: PC=0x%04X written\n", pc_word);
-  return true;
-}
+// writePcWord supprimée - utiliser uhfWritePcWord()
 
 
 // === WRITE EPC 96-bit SEULEMENT avec logs détaillés ===
@@ -868,7 +583,7 @@ static WriteError writeEpcWithPc(const uint8_t* epc, size_t epc_bytes, uint32_t 
         uint16_t new_pc = (current_pc & 0x07FF) | 0x3000;  // Garder les bits de protocole, changer la longueur
         Serial.printf("New PC word: 0x%04X\n", new_pc);
         
-        if (!writePcWord(new_pc, accessPwd)) {
+        if (!uhfWritePcWord(new_pc, accessPwd)) {
           Serial.println("❌ PC WRITE FAILED");
           Serial.println("WRITE ABORTED: Cannot set PC word");
           Serial.println("==================================================");
@@ -885,7 +600,7 @@ static WriteError writeEpcWithPc(const uint8_t* epc, size_t epc_bytes, uint32_t 
     use_default_pc:
     uint16_t default_pc = 0x3000;
     
-    if (!writePcWord(default_pc, accessPwd)) {
+    if (!uhfWritePcWord(default_pc, accessPwd)) {
       Serial.println("❌ PC WRITE FAILED");  
       Serial.println("WRITE ABORTED: Cannot set PC word");
       Serial.println("==================================================");
@@ -1059,7 +774,7 @@ static WriteError writeEpcWithPc(const uint8_t* epc, size_t epc_bytes, uint32_t 
   delay(50);  // Délai pour stabilisation
   
   Serial.println("Performing verification scan...");
-  stopMultiInv(Serial2);
+  uhfStopMultiInventory();
   delay(100);
   
   RawTagData verify_tags[8];
@@ -1150,7 +865,7 @@ static WriteError writeEpcVariableSafe(const uint8_t* epc, size_t epc_bytes, uin
     uint16_t new_pc = (current_pc & 0x07FF) | (uint16_t(words_target) << 11);
     Serial.printf("Writing PC: 0x%04X\n", new_pc);
     
-    if (!writePcWord(new_pc, accessPwd)) {
+    if (!uhfWritePcWord(new_pc, accessPwd)) {
       Serial.println("⚠️ PC write failed, continuing anyway");
       // si PC word refuse, on tente quand même l'écriture EPC (certains firmwares le mettent à jour eux-mêmes)
     }
@@ -1404,7 +1119,7 @@ static void cleanupOldTags() {
 // Démarrage du mode inventory continu - Version simplifiée
 static bool startContinuousInventory() {
   // Arrêter toute opération en cours
-  stopMultiInv(Serial2);
+  uhfStopMultiInventory();
   delay(100);
   
   Serial.println("Starting continuous mode (using repeated polling)");
@@ -1449,13 +1164,13 @@ static void processContinuousScan() {
         Serial.printf("NEW TAG: %s RSSI: %d dBm\n", epc_str.c_str(), rssi_value);
         
         // Brief stop pour éviter conflicts RF avant select  
-        stopMultiInv(Serial2);
+        uhfStopMultiInventory();
         delay(10);
         
         uint8_t epc_bytes[62];
         size_t epc_len = epc_str.length() / 2;
         if (hexToBytes(epc_str, epc_bytes, sizeof(epc_bytes)) &&
-            selectByEpcRaw(epc_bytes, epc_len))
+            uhfSelectEpc(epc_bytes, epc_len))
         {
           uint8_t tid_buf[8];
           if (readTid(tid_buf)) {
@@ -1530,17 +1245,17 @@ static void performEpcWrite() {
   }
   
   // Stopper multi-inventory
-  stopMultiInv(Serial2);
+  uhfStopMultiInventory();
   delay(50);
   
   // Sélectionner le tag
   bool selected = false;
   selected = rawSelect(current_tag.epc, current_tag.epc_len);
   if (!selected) {
-    selected = selectByEpcRaw(current_tag.epc, current_tag.epc_len);
+    selected = uhfSelectEpc(current_tag.epc, current_tag.epc_len);
   }
   if (!selected && current_tag.has_tid) {
-    selected = selectByTid(current_tag.tid);
+    selected = uhfSelectTid64(current_tag.tid);
   }
   
   if (!selected) {
@@ -1573,36 +1288,7 @@ static void performEpcWrite() {
 }
 
 // === NEW: Read-back EPC complet via PC word, en s'appuyant 100% sur rawRead() ===
-static bool readEpcFullFromPcRaw(uint8_t* epc_buf, size_t& epc_len, uint16_t& out_pc) {
-  epc_len = 0;
-  out_pc  = 0;
-  if (!epc_buf) return false;
-
-  // 1) Lire le PC word (Bank EPC, WordPtr=1, 1 word)
-  uint8_t pc_bytes[2] = {0};
-  int n = rawRead(/*bank*/0x01, /*word_ptr*/1, pc_bytes, sizeof(pc_bytes), /*word_count*/1, ACCESS_PWD);
-  if (n < 2) {
-    Serial.println("❌ readEpcFullFromPcRaw: failed to read PC word");
-    return false;
-  }
-  out_pc = (uint16_t(pc_bytes[0]) << 8) | pc_bytes[1];
-  uint8_t num_words = (out_pc >> 11) & 0x1F;   // longueur EPC en mots de 16 bits
-  if (num_words == 0 || num_words > 31) {
-    Serial.printf("❌ Invalid EPC length encoded in PC: %u words\n", num_words);
-    return false;
-  }
-
-  // 2) Lire l'EPC (Bank EPC, WordPtr=2)
-  size_t need_bytes   = size_t(num_words) * 2;
-  if (need_bytes > 62) need_bytes = 62;        // garde-fou protocole
-  n = rawRead(/*bank*/0x01, /*word_ptr*/2, epc_buf, need_bytes, /*word_count*/num_words, ACCESS_PWD);
-  if (n <= 0) {
-    Serial.println("❌ readEpcFullFromPcRaw: failed to read EPC bytes");
-    return false;
-  }
-  epc_len = size_t(n);
-  return true;
-}
+// readEpcFullFromPcRaw supprimée - utiliser uhfReadEpcViaPc()
 
 // === NEW: Wrapper "write + reselect + read-back" basé rawRead() + fallback TID ===
 static WriteError writeEpcVariableSafeWithVerifyRaw(const uint8_t* epc, size_t epc_bytes, uint32_t accessPwd) {
@@ -1610,23 +1296,32 @@ static WriteError writeEpcVariableSafeWithVerifyRaw(const uint8_t* epc, size_t e
   WriteError err = writeEpcVariableSafe(epc, epc_bytes, accessPwd);
   if (err != WRITE_OK) return err;
 
-  // 2) Reselect post-write (full → 96b → TID)
-  stopMultiInv(Serial2);              // <-- calmer la couche RF
+  // 2) Reselect post-write (wake + full → 96b → TID → reset-select retry)
+  uhfStopMultiInventory();
   delay(20);
+  { RawTagData tmp[1]; (void)rawInventoryWithRssi(tmp, 1); } // wake the tag
+  delay(10);
   size_t try_len = epc_bytes;
   if (try_len & 1) try_len++;           // alignement sécurité (mots)
   if (try_len > 62) try_len = 62;
 
   bool selected = false;
   Serial.println("🔁 Post-write reselect (full EPC)...");
-  selected = selectByEpcRaw(epc, try_len);
+  selected = uhfSelectEpc(epc, try_len);
   if (!selected && try_len > 12) {
     Serial.println("⚠️ Full-length SELECT failed → trying 96-bit prefix");
-    selected = selectByEpcRaw(epc, 12);
+    selected = uhfSelectEpc(epc, 12);
   }
   if (!selected && current_tag.has_tid) {
     Serial.println("⚠️ Prefix SELECT failed → trying TID");
-    selected = selectByTid(current_tag.tid);
+    selected = uhfSelectTid64(current_tag.tid);
+  }
+  if (!selected) {
+    // Last-chance: reset select mode to EPC and try again
+    setSelectMode(0x00); // EPC
+    { RawTagData tmp[1]; (void)rawInventoryWithRssi(tmp, 1); }
+    delay(10);
+    selected = uhfSelectEpc(epc, min(try_len,(size_t)12));
   }
   if (!selected) {
     Serial.println("❌ Post-write reselect FAILED (EPC/TID)");
@@ -1635,11 +1330,13 @@ static WriteError writeEpcVariableSafeWithVerifyRaw(const uint8_t* epc, size_t e
     Serial.println("✅ Post-write reselect OK");
   }
 
-  // 3) Read-back EPC complet via PC word (source de vérité)
-  stopMultiInv(Serial2);              // <-- éviter collision avec inventaire
+  // 3) Read-back EPC via PC (source of truth)
+  uhfStopMultiInventory();
   delay(20);
+  { RawTagData tmp[1]; (void)rawInventoryWithRssi(tmp, 1); } // re-energize link
+  delay(10);
   uint8_t epc_read[62]; size_t epc_read_len = 0; uint16_t pc_after = 0;
-  if (readEpcFullFromPcRaw(epc_read, epc_read_len, pc_after)) {
+  if (uhfReadEpcViaPc(epc_read, epc_read_len, pc_after, ACCESS_PWD)) {
     Serial.printf("🔍 PC after write: 0x%04X (len=%u words)\n", pc_after, (pc_after >> 11) & 0x1F);
     Serial.print("🔍 EPC read-back: ");
     for (size_t i = 0; i < epc_read_len; ++i) Serial.printf("%02X", epc_read[i]);
@@ -1667,10 +1364,11 @@ void setup() {
   Serial2.setRxBufferSize(RX_BUFFER_SIZE);  // AVANT begin()
   Serial2.begin(115200, SERIAL_8N1, RX_PIN, TX_PIN);
   Serial2.setTimeout(300);
+  uhfAttachSerial(&Serial2);
   
   // uhf.begin(&Serial2, 115200, RX_PIN, TX_PIN, false);  // Remplacé par raw
   
-  stopMultiInv(Serial2);
+  uhfStopMultiInventory();
   
   // Vérifier la connexion
   String info = "ERROR";
@@ -1720,7 +1418,7 @@ void loop() {
       Serial.println(F("🔹 TEST WRITE EPC 128 bits..."));
       
       // Sécurisation : arrêter multi-inventory et sélectionner un tag
-      stopMultiInv(Serial2);
+      uhfStopMultiInventory();
       delay(20);
       
       bool tag_selected = false;
@@ -1728,7 +1426,7 @@ void loop() {
         // Utiliser le tag scanné précédemment
         Serial.println(F("📍 Using previously scanned tag for selection"));
         tag_selected = rawSelect(current_tag.epc, current_tag.epc_len)
-                       || selectByEpcRaw(current_tag.epc, current_tag.epc_len); // fallback EPC raw
+                       || uhfSelectEpc(current_tag.epc, current_tag.epc_len); // fallback EPC raw
       } else {
         // Fallback: poll 1 tag et select
         Serial.println(F("📍 No previous tag - scanning for selection"));
@@ -1737,7 +1435,7 @@ void loop() {
           uint8_t b[62]; 
           size_t L = one[0].epc.length() / 2;
           if (hexToBytes(one[0].epc, b, sizeof(b))) {
-            tag_selected = rawSelect(b, L) || selectByEpcRaw(b, L); // fallback EPC raw
+            tag_selected = rawSelect(b, L) || uhfSelectEpc(b, L); // fallback EPC raw
           }
         }
       }
@@ -1779,7 +1477,7 @@ void loop() {
           displayStatus("ERROR", "Failed to start", "continuous mode");
         }
       } else {
-        stopMultiInv(Serial2);
+        uhfStopMultiInventory();
         displayStatus("CONTINUOUS SCAN", "Stopped", "Back to normal mode");
         M5.Speaker.tone(800, 200, 0, false);  // Bip d'arrêt
         Serial.println("=== CONTINUOUS SCAN STOPPED ===");
@@ -1798,14 +1496,14 @@ void loop() {
     // Si en mode continu, A court l'arrête
     if (continuous_scan_active) {
       continuous_scan_active = false;
-      stopMultiInv(Serial2);
+      uhfStopMultiInventory();
       displayStatus("SCAN STOPPED", "Continuous mode", "disabled");
       M5.Speaker.tone(800, 100, 0, false);  // Bip d'arrêt
       return;
     }
     
     // Sinon, scan normal
-    stopMultiInv(Serial2);
+    uhfStopMultiInventory();
     
     // Utiliser notre parser universel au lieu de uhf.pollingOnce()
     RawTagData raw_tags[8];
