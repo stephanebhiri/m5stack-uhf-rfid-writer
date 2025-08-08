@@ -503,7 +503,7 @@ static WriteError writeEpcWithPc(const uint8_t* epc, size_t epc_bytes, uint32_t 
   // Vérification puissance pour EPC > 96-bit
   if (epc_bytes > 12 && current_power_index < 2) {
     Serial.printf("WARNING: %u-bit EPC write needs max power (30dBm). Current: %s\n", 
-                  epc_bytes * 8, getCurrentPowerName());
+                  epc_bytes * 8, getCurrentPowerText());
     Serial.println("Try cycling power with Button C in continuous mode first.");
   }
   
